@@ -61,9 +61,6 @@ def _measure(method: str, batches, prefill_length: str, channel_ratio: str,
     _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     if _REPO not in sys.path:
         sys.path.insert(0, _REPO)
-    LMMS = os.path.join(_REPO, "lmms-eval")
-    if LMMS not in sys.path:
-        sys.path.insert(0, LMMS)
 
     import torch
 

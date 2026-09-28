@@ -14,7 +14,7 @@ triton==3.1.0
 flash-attn==2.7.0.post2
 
 # Eval framework — install separately with `pip install lmms-eval==0.6.0`
-# and apply the overrides in lmms_eval_overrides/
+# and apply the overrides in integrations/lmms_eval/
 
 # Image / data utilities
 Pillow==10.4.0

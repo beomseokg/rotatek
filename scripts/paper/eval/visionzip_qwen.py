@@ -17,7 +17,7 @@ if _REPO not in sys.path:
 
 import gc
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 os.environ["MODEL_VERSION"] = "gpt-4o-mini"
 

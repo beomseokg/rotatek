@@ -11,7 +11,7 @@
 
 set -uo pipefail   # NOTE: not 'set -e' — one method's failure shouldn't kill the rest
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO"
 
 mkdir -p logs
@@ -44,7 +44,7 @@ echo "Sweep started: $(date)" | tee "$MASTER_LOG"
 # 1) Full baseline
 for S in "${SEQLENS[@]}"; do
     run_one "full_${S}" \
-        python -m latency.model_end_to_end_llava_next \
+        python -m scripts.paper.latency.model_end_to_end_llava_next \
             --methods full \
             --prefill_length "$S" \
             "${COMMON_PER_S[@]}" \
@@ -54,7 +54,7 @@ done
 # 2) ThinK (default-mode compile)
 for S in "${SEQLENS[@]}"; do
     run_one "think_${S}" env THINK_COMPILE=default \
-        python -m latency.model_end_to_end_llava_next \
+        python -m scripts.paper.latency.model_end_to_end_llava_next \
             --methods think \
             --prefill_length "$S" \
             "${COMMON_PER_S[@]}" \
@@ -64,7 +64,7 @@ done
 # 3) SparK (default-mode compile)
 for S in "${SEQLENS[@]}"; do
     run_one "spark_${S}" env SPARK_COMPILE=default \
-        python -m latency.model_end_to_end_llava_next \
+        python -m scripts.paper.latency.model_end_to_end_llava_next \
             --methods spark \
             --prefill_length "$S" \
             "${COMMON_PER_S[@]}" \
@@ -74,7 +74,7 @@ done
 # 4) RotateK (reduce-overhead compile)
 for S in "${SEQLENS[@]}"; do
     run_one "rotatek_${S}" env ROTATEK_COMPILE=1 \
-        python -m latency.model_end_to_end_llava_next \
+        python -m scripts.paper.latency.model_end_to_end_llava_next \
             --methods rotatek \
             --prefill_length "$S" \
             "${COMMON_PER_S[@]}" \

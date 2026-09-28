@@ -7,7 +7,7 @@
 
 set -uo pipefail   # NOTE: not 'set -e' — one method's failure shouldn't kill the rest
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO"
 
 mkdir -p logs
@@ -37,28 +37,28 @@ echo "Sweep started: $(date)" | tee "$MASTER_LOG"
 
 # 1) Full baseline
 run_one "full" \
-    python -m latency.model_end_to_end_llava_next \
+    python -m scripts.paper.latency.model_end_to_end_llava_next \
         --methods full \
         "${COMMON[@]}" \
         --tag a100_llava_next_full_batch_v3
 
 # 2) ThinK (default-mode compile)
 run_one "think" env THINK_COMPILE=default \
-    python -m latency.model_end_to_end_llava_next \
+    python -m scripts.paper.latency.model_end_to_end_llava_next \
         --methods think \
         "${COMMON[@]}" \
         --tag a100_llava_next_think_batch_v3
 
 # 3) SparK (default-mode compile)
 run_one "spark" env SPARK_COMPILE=default \
-    python -m latency.model_end_to_end_llava_next \
+    python -m scripts.paper.latency.model_end_to_end_llava_next \
         --methods spark \
         "${COMMON[@]}" \
         --tag a100_llava_next_spark_batch_v3
 
 # 4) RotateK (reduce-overhead compile)
 run_one "rotatek" env ROTATEK_COMPILE=1 \
-    python -m latency.model_end_to_end_llava_next \
+    python -m scripts.paper.latency.model_end_to_end_llava_next \
         --methods rotatek \
         "${COMMON[@]}" \
         --tag a100_llava_next_rotatek_batch_v3

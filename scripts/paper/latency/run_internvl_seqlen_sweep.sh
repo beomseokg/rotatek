@@ -7,7 +7,7 @@
 
 set -uo pipefail   # NOTE: not 'set -e' — one method's failure shouldn't kill the rest
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO"
 
 mkdir -p logs
@@ -37,28 +37,28 @@ echo "Sweep started: $(date)" | tee "$MASTER_LOG"
 
 # 1) Full baseline
 run_one "full" \
-    python -m latency.model_end_to_end_internvl \
+    python -m scripts.paper.latency.model_end_to_end_internvl \
         --methods full \
         "${COMMON[@]}" \
         --tag a100_internvl_full_seqlen_v2
 
 # 2) ThinK (default-mode compile)
 run_one "think" env THINK_COMPILE=default \
-    python -m latency.model_end_to_end_internvl \
+    python -m scripts.paper.latency.model_end_to_end_internvl \
         --methods think \
         "${COMMON[@]}" \
         --tag a100_internvl_think_seqlen_v2
 
 # 3) SparK (default-mode compile)
 run_one "spark" env SPARK_COMPILE=default \
-    python -m latency.model_end_to_end_internvl \
+    python -m scripts.paper.latency.model_end_to_end_internvl \
         --methods spark \
         "${COMMON[@]}" \
         --tag a100_internvl_spark_seqlen_v2
 
 # 4) RotateK (reduce-overhead compile)
 run_one "rotatek" env ROTATEK_COMPILE=1 \
-    python -m latency.model_end_to_end_internvl \
+    python -m scripts.paper.latency.model_end_to_end_internvl \
         --methods rotatek \
         "${COMMON[@]}" \
         --tag a100_internvl_rotatek_seqlen_v2

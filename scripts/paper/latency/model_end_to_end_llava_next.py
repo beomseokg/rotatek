@@ -39,9 +39,6 @@ torch.set_num_threads(8)
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
-LMMS_PKG = os.path.join(_REPO, "lmms-eval")
-if LMMS_PKG not in sys.path:
-    sys.path.insert(0, LMMS_PKG)
 
 
 PRETRAINED = "llava-hf/llama3-llava-next-8b-hf"
