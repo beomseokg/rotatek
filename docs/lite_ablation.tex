@@ -1,0 +1,53 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.9in]{geometry}\usepackage{times,booktabs,amsmath,xcolor}
+\setlength{\parindent}{0pt}\setlength{\parskip}{5pt}
+\begin{document}
+\begin{center}{\large\textbf{RotateK --- lmms-eval Lite Ablation}}\\[2pt]
+{\itshape Token-only vs.\ ThinK / SparK / RotateK at matched KV budgets}\end{center}
+
+\textbf{Setup.} Qwen2.5-VL-7B-Instruct on the \texttt{lmms-lab/LMMs-Eval-Lite} splits
+of TextVQA, InfoVQA and ChartQA (500 samples each), greedy decoding, one A100-80GB per
+cell. Metrics are exact match (TextVQA), ANLS (InfoVQA) and relaxed accuracy (ChartQA).
+Within each framework all rows share a KV budget: VisionZip
+$\rho_t{=}0.28$ vs.\ $\rho_t{=}0.45,\rho_c{=}0.25$ (both $0.28\times$); FastV
+$\rho_t{=}0.25$ vs.\ $\rho_t{=}0.40,\rho_c{=}0.25$ (both $0.25\times$). VisionZip's
+token ratio is \texttt{dominant}$+$\texttt{contextual}, with \texttt{contextual}$=0.05$
+throughout. Reproduce with \texttt{scripts/paper/eval/lite\_sweep.py}.
+
+\begin{center}\small
+\begin{tabular}{@{}l ccc c@{}}
+\toprule
+& TextVQA & InfoVQA & ChartQA & \textbf{Mean}\\
+\midrule
+VisionZip Token$_{0.28}$ & 79.60\,\tiny$\pm$1.70 & 60.78\,\tiny$\pm$2.02 & 62.80\,\tiny$\pm$2.16 & 67.73\\
+\quad $+$ ThinK & 76.96\,\tiny$\pm$1.77 & 65.89\,\tiny$\pm$1.96 & 72.00\,\tiny$\pm$2.01 & 71.62\\
+\quad $+$ SparK & 82.72\,\tiny$\pm$1.56 & 69.39\,\tiny$\pm$1.94 & 72.40\,\tiny$\pm$2.00 & 74.84\\
+\quad $+$ \textbf{RotateK} & 81.42\,\tiny$\pm$1.62 & 69.22\,\tiny$\pm$1.94 & 72.00\,\tiny$\pm$2.01 & \textbf{74.21}\\
+\addlinespace[3pt]
+FastV Token$_{0.25}$ & 83.12\,\tiny$\pm$1.55 & 54.81\,\tiny$\pm$2.09 & 60.20\,\tiny$\pm$2.19 & 66.04\\
+\quad $+$ ThinK & 79.20\,\tiny$\pm$1.70 & 63.28\,\tiny$\pm$2.01 & 69.20\,\tiny$\pm$2.07 & 70.56\\
+\quad $+$ SparK & 85.58\,\tiny$\pm$1.44 & 66.67\,\tiny$\pm$1.99 & 70.00\,\tiny$\pm$2.05 & 74.08\\
+\quad $+$ \textbf{RotateK} & 85.20\,\tiny$\pm$1.46 & 66.71\,\tiny$\pm$1.97 & 70.80\,\tiny$\pm$2.04 & \textbf{74.24}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{What reproduces.} Spending the KV budget on Key channels rather than on tokens
+alone is clearly better: against token-only pruning at the same budget, the channel
+methods gain $+3.9$ to $+8.2$ mean points. RotateK improves over ThinK by
+$\mathbf{+2.6}$ (VisionZip) and $\mathbf{+3.7}$ (FastV) mean points, reproducing the
+paper's central channel-pruning comparison.
+
+\textbf{What does not.} RotateK and SparK are \emph{within noise of each other} here
+($-0.63$ on VisionZip, $+0.16$ on FastV), whereas the paper reports RotateK ahead.
+With 500 samples per benchmark the per-cell standard error is $1.5$--$2.1$ points, so a
+$0.6$-point mean gap is not resolvable. This ablation also covers three benchmarks,
+where the paper averages five (adding DocVQA and VizWiz), and uses lite rather than full
+validation splits. Separately, the paper's case against SparK is primarily about decode
+latency --- its per-token masks preclude the shared fused kernel --- which this
+accuracy-only ablation does not measure.
+
+\textbf{Reading the numbers.} Values are percentages with the benchmark's own standard
+error; means are unweighted over the three benchmarks. Raw per-cell outputs, including
+the full metric dictionaries, are in the run logs.
+\end{document}
