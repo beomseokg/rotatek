@@ -1,17 +1,18 @@
-# RotateK
+<h1 align="center">RotateK</h1>
+<h3 align="center">Rotation-Aligned Key Channel Pruning for Efficient Vision-Language Model Inference</h3>
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2605.19218">
-    <img alt="arXiv" src="https://img.shields.io/badge/arXiv-2605.19218-b31b1b.svg?style=for-the-badge&logo=arxiv&logoColor=white">
-  </a>
-  <a href="LICENSE">
-    <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge">
-  </a>
-  <img alt="Python 3.11" src="https://img.shields.io/badge/Python-3.11-3776AB.svg?style=for-the-badge&logo=python&logoColor=white">
-  <img alt="PyTorch 2.6" src="https://img.shields.io/badge/PyTorch-2.6-EE4C2C.svg?style=for-the-badge&logo=pytorch&logoColor=white">
+  <a href="https://arxiv.org/abs/2605.19218"><img alt="arXiv" src="https://img.shields.io/badge/arXiv-2605.19218-b31b1b?logo=arxiv&logoColor=white"></a>
+  <a href="https://github.com/beomseokg/rotatek"><img alt="code" src="https://img.shields.io/badge/github-code-181717?logo=github&logoColor=white"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
+  <img alt="Python 3.11" src="https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white">
+  <img alt="PyTorch 2.6" src="https://img.shields.io/badge/pytorch-2.6-EE4C2C?logo=pytorch&logoColor=white">
 </p>
 
-**Rotation-aligned Key-channel pruning for vision-language model inference.**
+![RotateK inference flow](assets/inference_flow.png)
+
+This is the **official implementation** of *"Rotation-Aligned Key Channel Pruning
+for Efficient Vision-Language Model Inference"*.
 
 A single image can occupy thousands of KV-cache entries in a VLM. Token pruning
 shrinks that cache by discarding visual tokens outright, which costs accuracy on
@@ -20,8 +21,6 @@ instead: an online PCA-based rotation aligns token-dependent channel importance
 into a shared subspace, so a lightweight head-wise mask can keep a quarter of the
 Key channels with little loss. Under a fixed KV budget the freed memory buys more
 visual tokens — or, at a fixed token count, a smaller cache.
-
-![RotateK inference flow](assets/inference_flow.png)
 
 At **prefill** the rotation `R_k` is built once per layer and the visual Keys are
 stored rotated and truncated. At **decode** nothing is reconstructed: the query is
@@ -41,13 +40,30 @@ cd rotatek
 
 conda create -n rotatek python=3.11 -y && conda activate rotatek
 
-# PyTorch first, so triton / flash-attn pick up the matching CUDA build
+# 1. PyTorch first, so triton picks up the matching CUDA build
 pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+# 2. Everything else
 pip install -r requirements.txt
 ```
 
-No `pip install` of this repo is needed — the scripts add the repo root to
+That is enough for the `rotatek` package itself (rotation + Triton kernels).
+No `pip install` of this repo is needed — the scripts put the repo root on
 `sys.path` themselves, so they run from any working directory.
+
+### For the paper scripts
+
+`scripts/paper/` loads the backbones with `attn_implementation=flash_attention_2`,
+which needs FlashAttention. It is installed separately because its `setup.py`
+imports `torch` at build time, which fails inside pip's isolated build
+environment:
+
+```bash
+pip install flash-attn==2.7.4.post1 --no-build-isolation
+```
+
+Building from source takes a while; if a prebuilt wheel exists for your
+torch/CUDA/Python combination, pip will use it instead.
 
 ### For the accuracy benchmarks only
 

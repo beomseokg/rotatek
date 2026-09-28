@@ -1,45 +1,44 @@
-# RotateK supplementary — minimum dependencies for reproduction.
-# Tested on Python 3.11.14, CUDA 12.4, NVIDIA A100.
-# Note: install torch FIRST with a CUDA-matched wheel before this file.
+# RotateK — runtime dependencies.
+# Versions match the environment the paper was run in (Python 3.11, CUDA 12.4,
+# NVIDIA A100). See pip-freeze.full.txt for the complete dump.
+#
+# Install torch FIRST with a CUDA-matched wheel, then this file:
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+#
+# triton is intentionally NOT pinned here: torch 2.6.0 requires triton==3.2.0
+# and pulls it in itself. Pinning it separately only creates conflicts.
+#
+# flash-attn is also NOT listed. Its setup.py imports torch at build time, which
+# fails inside pip's isolated build environment, so it needs a separate install
+# (see README). It is required only by the scripts under scripts/paper/, not by
+# the rotatek package itself:
+#   pip install flash-attn==2.7.4.post1 --no-build-isolation
 
 # Core ML
-torch==2.6.0
-transformers==4.47.0
+transformers==4.49.0
 accelerate==1.12.0
 
-# Triton (kernel compilation for the fused decode path)
-triton==3.1.0
-
-# Attention backends
-flash-attn==2.7.0.post2
-
-# Eval framework — install separately with `pip install lmms-eval==0.6.0`
-# and apply the overrides in integrations/lmms_eval/
-
 # Image / data utilities
-Pillow==10.4.0
-numpy==1.26.4
-datasets==3.0.0
-einops==0.8.0
-sentencepiece==0.2.0
-tokenizers==0.21.0
+Pillow==12.2.0
+numpy==2.2.6
+datasets==4.0.0
+einops==0.8.1
+sentencepiece==0.2.1
+tokenizers==0.21.4
+huggingface-hub==0.36.2
 
-# OpenAI client (GPT-judge tasks: mmvet, llava_in_the_wild, dc100_en, ...)
-openai==1.50.0
-
-# Optional: Reka client (vibe_eval task only — uncomment if needed)
-# reka-api==2.0.0
+# GPT-judged tasks (mmvet, llava_in_the_wild, dc100_en, ...)
+openai==2.33.0
 
 # Logging / tooling
-loguru==0.7.2
+loguru==0.7.3
 PyYAML==6.0.3
-tenacity==9.0.0
-huggingface-hub==0.26.5
+tenacity==9.1.4
 
-# Plotting / parsing utilities (latency benchmark output)
-matplotlib==3.9.2
-pandas==2.2.3
+# Latency benchmark output parsing / plotting
+matplotlib==3.10.8
+pandas==2.3.3
 
-# (Full pip-freeze dump from our development environment is included
-# alongside this file as `pip-freeze.full.txt` for byte-exact reproduction
-# if needed — the entries above are the runtime essentials.)
+# Optional: Reka client, needed only by the vibe_eval task
+# reka-api==2.0.0
