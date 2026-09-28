@@ -63,6 +63,11 @@ pip install flash-attn==2.7.4.post1 --no-build-isolation
 Building from source takes a while; if a prebuilt wheel exists for your
 torch/CUDA/Python combination, pip will use it instead.
 
+> On clusters with an NFS home directory, this can fail with
+> `Invalid cross-device link` — pip builds the wheel in a local `/tmp` and then
+> cannot move it into the cache on NFS. Point both at the same filesystem:
+> `TMPDIR=~/.cache/pip/tmp pip install flash-attn==2.7.4.post1 --no-build-isolation`
+
 ### For the accuracy benchmarks only
 
 Accuracy is evaluated through [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval).
