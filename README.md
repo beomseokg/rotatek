@@ -1,5 +1,16 @@
 # RotateK
 
+<p align="center">
+  <a href="https://arxiv.org/abs/2605.19218">
+    <img alt="arXiv" src="https://img.shields.io/badge/arXiv-2605.19218-b31b1b.svg?style=for-the-badge&logo=arxiv&logoColor=white">
+  </a>
+  <a href="LICENSE">
+    <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge">
+  </a>
+  <img alt="Python 3.11" src="https://img.shields.io/badge/Python-3.11-3776AB.svg?style=for-the-badge&logo=python&logoColor=white">
+  <img alt="PyTorch 2.6" src="https://img.shields.io/badge/PyTorch-2.6-EE4C2C.svg?style=for-the-badge&logo=pytorch&logoColor=white">
+</p>
+
 **Rotation-aligned Key-channel pruning for vision-language model inference.**
 
 A single image can occupy thousands of KV-cache entries in a VLM. Token pruning
@@ -17,9 +28,6 @@ stored rotated and truncated. At **decode** nothing is reconstructed: the query 
 rotated into the same subspace (`q_t → R_k → q̃_t`) and a fused Triton kernel runs
 the sparse-channel path over the visual span and the full-channel path over the
 prompt and text span in one launch, merging them with a single online softmax.
-
-> 📄 Paper: *Rotation-Aligned Key Channel Pruning for Efficient Vision-Language
-> Model Inference* — [arXiv](https://arxiv.org/abs/XXXX.XXXXX)
 
 ---
 
@@ -170,9 +178,9 @@ Behaviour is controlled by environment variables:
 ```bibtex
 @article{kang2026rotatek,
   title   = {Rotation-Aligned Key Channel Pruning for Efficient Vision-Language Model Inference},
-  author  = {Kang, Beomseok},
-  year    = {2026},
-  journal = {arXiv preprint arXiv:XXXX.XXXXX}
+  author  = {Kang, Beomseok and Jo, Dongwon and Song, Jiwon and Son, Donghwee and Kim, Jae-Joon},
+  journal = {arXiv preprint arXiv:2605.19218},
+  year    = {2026}
 }
 ```
 
