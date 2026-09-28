@@ -71,20 +71,25 @@ torch/CUDA/Python combination, pip will use it instead.
 ### For the accuracy benchmarks only
 
 Accuracy is evaluated through [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval).
-RotateK hooks into the model definitions, so the integration files are copied over
-an installed lmms-eval:
+RotateK hooks into the model definitions, so its integration has to be installed
+over an installed lmms-eval:
 
 ```bash
-pip install lmms-eval==0.6.0
+# lmms-eval pulls its own torch; install it BEFORE pinning torch, or re-pin after
+pip install lmms-eval==0.5.0
+pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
-LMMS_DIR="$(python -c 'import lmms_eval, os; print(os.path.dirname(lmms_eval.__file__))')"
-cp -r integrations/lmms_eval/* "$LMMS_DIR/"
+python integrations/apply_overrides.py          # copy files + register models
+python integrations/apply_overrides.py --check  # verify
 ```
 
-Eleven files are touched: eight model hooks (RotateK, ThinK and SparK on
-LLaVA-NeXT, Qwen2.5-VL and InternVL2.5) and three task fixes (`dc100_en`,
-`wild_vision_bench`). The directory layout mirrors `lmms_eval/...`, so the copy is
-flat. Latency benchmarks do **not** need this step.
+`apply_overrides.py` does three things that a plain file copy does not: it copies
+the integration files, registers the wrappers in lmms-eval's model registry
+(otherwise `--model qwen2_5_vl_visionzip` reports "not found"), and drops a
+`.pth` so the copied wrappers can `import rotatek` from site-packages. It is
+idempotent and backs up the file it edits.
+
+Latency benchmarks do **not** need any of this.
 
 ---
 
