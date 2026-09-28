@@ -1,0 +1,45 @@
+# RotateK supplementary — minimum dependencies for reproduction.
+# Tested on Python 3.11.14, CUDA 12.4, NVIDIA A100.
+# Note: install torch FIRST with a CUDA-matched wheel before this file.
+
+# Core ML
+torch==2.6.0
+transformers==4.47.0
+accelerate==1.12.0
+
+# Triton (kernel compilation for the fused decode path)
+triton==3.1.0
+
+# Attention backends
+flash-attn==2.7.0.post2
+
+# Eval framework — install separately with `pip install lmms-eval==0.6.0`
+# and apply the overrides in lmms_eval_overrides/
+
+# Image / data utilities
+Pillow==10.4.0
+numpy==1.26.4
+datasets==3.0.0
+einops==0.8.0
+sentencepiece==0.2.0
+tokenizers==0.21.0
+
+# OpenAI client (GPT-judge tasks: mmvet, llava_in_the_wild, dc100_en, ...)
+openai==1.50.0
+
+# Optional: Reka client (vibe_eval task only — uncomment if needed)
+# reka-api==2.0.0
+
+# Logging / tooling
+loguru==0.7.2
+PyYAML==6.0.3
+tenacity==9.0.0
+huggingface-hub==0.26.5
+
+# Plotting / parsing utilities (latency benchmark output)
+matplotlib==3.9.2
+pandas==2.2.3
+
+# (Full pip-freeze dump from our development environment is included
+# alongside this file as `pip-freeze.full.txt` for byte-exact reproduction
+# if needed — the entries above are the runtime essentials.)
