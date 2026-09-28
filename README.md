@@ -5,8 +5,6 @@
   <a href="https://arxiv.org/abs/2605.19218"><img alt="arXiv" src="https://img.shields.io/badge/arXiv-2605.19218-b31b1b?logo=arxiv&logoColor=white"></a>
   <a href="https://github.com/beomseokg/rotatek"><img alt="code" src="https://img.shields.io/badge/github-code-181717?logo=github&logoColor=white"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
-  <img alt="Python 3.11" src="https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white">
-  <img alt="PyTorch 2.6" src="https://img.shields.io/badge/pytorch-2.6-EE4C2C?logo=pytorch&logoColor=white">
 </p>
 
 ![RotateK inference flow](assets/inference_flow.png)
