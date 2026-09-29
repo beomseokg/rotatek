@@ -7,7 +7,8 @@ import torch
 
 
 class Cache:
-    """Base class the adapters `isinstance`-check against."""
+    """Name used in the type hints (`Optional[Cache]`, as in the HF code the
+    adapters are copied from); `DynamicCache` below is the only implementation."""
 
 
 class DynamicCache(Cache):
