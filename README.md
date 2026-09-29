@@ -37,7 +37,7 @@ installed. Do only the tier you need.
 | --- | --- | --- |
 | **1. Kernel microbenchmarks** | torch + triton | `scripts/paper/kernel/` |
 | **2. Model latency** | $+$ the backbone weights, FlashAttention, lmms-eval integration | `scripts/paper/latency/` |
-| **3. Accuracy** | $+$ benchmark datasets (and an API key for GPT-judged tasks) | `scripts/paper/accuracy/` |
+| **3. Accuracy** | $+$ benchmark datasets | `scripts/paper/accuracy/` |
 
 Python 3.11 and a CUDA-capable GPU are required throughout (the decode kernel is
 Triton).
@@ -90,8 +90,14 @@ backs up the file it edits.
 ### Tier 3 — accuracy
 
 Nothing further to install; the benchmarks download on first use through
-lmms-eval. GPT-judged tasks (`mmvet`, `llava_in_the_wild`, `dc100_en`) need
-`OPENAI_API_KEY`.
+lmms-eval. The five VQA benchmarks the paper reports (TextVQA, InfoVQA, ChartQA,
+DocVQA, VizWiz) are scored by rule-based metrics — exact match, ANLS, relaxed
+accuracy — so no API key is involved.
+
+Only the open-ended benchmarks need one: `llava_in_the_wild` and `mmvet` are
+scored by a GPT judge (`gpt-4o-mini` by default), so running those requires
+`OPENAI_API_KEY` and costs roughly \$0.0002 per sample. `vibe_eval` uses Reka
+Core instead and needs `reka-api` plus `REKA_API_KEY`.
 
 ---
 
@@ -202,7 +208,7 @@ Behaviour is controlled by environment variables:
 | `ROTATEK_COMPILE` | unset | `1` or `reduce-overhead` to CUDA-graph the subspace iteration |
 | `THINK_COMPILE` / `SPARK_COMPILE` | unset | Same, for the baselines |
 | `HF_HOME` | `~/.cache/huggingface` | Model cache |
-| `OPENAI_API_KEY` | — | Needed only for GPT-judged tasks (`mmvet`, `llava_in_the_wild`, `dc100_en`) |
+| `OPENAI_API_KEY` | — | Only for the GPT-judged open-ended tasks (`llava_in_the_wild`, `mmvet`, `dc100_en`); the five VQA benchmarks need no key |
 | `MODEL_VERSION` | `gpt-4o-mini` | Judge model for those tasks |
 
 ---
