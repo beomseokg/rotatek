@@ -6,14 +6,8 @@ A stripped-down kernel for the **all-channel** decode case used by:
   * ThinK    — after boolean-indexing recovery to full-D K
   * SparK    — after boolean-indexing recovery to full-D K
 
-These all hand a single `[B, H_kv, S, D]` K/V buffer to attention. The
-kernel mirrors the dense path of `sparse_channel_decode_triton` but
-drops the dual-segment (k_full + k_sparse) logic, the bias-shift, and
-the q_sparse/D_keep handling — yielding lower register pressure and a
-simpler Triton compile.
-
-RotateK does NOT use this kernel (it has its own fused phase-1 in
-``methods/rotatek/kernel.py``).
+These all hand a single `[B, H_kv, S, D]` K/V buffer to attention.
+RotateK does not use this kernel; see ``fused_decode.py``.
 
 Public API: ``full_channel_decode_triton(q, k, v, num_kv_groups)``.
 """

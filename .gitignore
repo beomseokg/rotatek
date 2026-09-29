@@ -14,3 +14,4 @@ results/
 logs/
 *.log
 *.json.tmp
+submissions/

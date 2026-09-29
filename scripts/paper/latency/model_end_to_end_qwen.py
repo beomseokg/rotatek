@@ -1,7 +1,7 @@
 """End-to-end latency benchmark for channel-pruning methods on Qwen2.5-VL.
 
-Mirrors `model_end_to_end_internvl.py` / `model_end_to_end_llava_next.py`
-but adapted for `Qwen/Qwen2.5-VL-7B-Instruct`. Inputs are synthetic —
+Same measurement as `model_end_to_end_llava_next.py`, for
+`Qwen/Qwen2.5-VL-7B-Instruct`. Inputs are synthetic —
 random `inputs_embeds` of layout
 `[prompt(30) | vision(--prefill_length) | text(30)]` fed directly to the
 Qwen2.5-VL conditional-generation wrapper (vision tower bypassed; the
@@ -9,7 +9,7 @@ wrapper detects `input_ids is None` and skips the visual scatter path).
 Only the vision span is channel-pruned.
 
 Usage:
-  python -m latency.model_end_to_end_qwen \\
+  python scripts/paper/latency/model_end_to_end_qwen.py \\
       --methods full,think,spark,rotatek \\
       --prefill_length 8k,16k,32k,64k \\
       --batch_sizes 1,2,4 \\
@@ -105,15 +105,9 @@ def _load_visionzip(method: str, channel_ratio: str):
         f"attn_implementation=flash_attention_2,"
         f"channel_ratio={channel_ratio},"
         f"channel_method={method},"
-        f"layer_adaptive_channel_budget=False,"
-        f"channel_reconstruction=off,"
-        f"reconstruction_constant=0.1,"
-        f"custom_kernel=False,"
-        f"decode_attention_backend=triton,"
-        f"calibration_mode=off,"
-        f"offline_calibration_tasks=channel_importance"
+        f"decode_attention_backend=triton"
     )
-    LM = models.get_model("qwen2_5_vl_visionzip", force_simple=False)
+    LM = models.get_model("qwen2_5_vl_visionzip")
     lm = LM.create_from_arg_string(
         model_args, {"batch_size": 1, "max_batch_size": None, "device": "cuda:0"},
     )

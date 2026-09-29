@@ -1,66 +1,32 @@
-"""Three-kernel split-K decode for RotateK: prelude → (sparse + full) → merge.
+"""Two-kernel split-K decode for RotateK.
 
-Why three kernels (and not the previous "one phase-1 with split-0 branch")
-==========================================================================
+Vision Keys are cached rotated and truncated (``[S_v, D_keep]``); prompt and
+text Keys stay at full width. One decode step runs
 
-The earlier design fused the full-D (prompt + text) and sparse (vision in
-truncated D_keep) paths into a single phase-1 kernel, gating the full-D
-loop on `if pid_s == 0`. This kept the launch count low but had a serious
-hidden cost: Triton's compiler must allocate registers for the union of
-both branches, so ALL split programs (including pid_s = 1..N-1, which only
-run the sparse path) carried the q_full[BLOCK_D=128] + extra control-flow
-register footprint. Higher per-program register count → lower SM
-occupancy → memory-latency hiding broken → ~4× off from theoretical
-bandwidth.
+1. ``_rotatek_sparse_kernel`` — grid (B, H_q, NUM_SPLITS). Each program rotates
+   the query into the kept subspace in registers (q @ R_partial, plus the
+   q · δμ mean-correction bias) and runs an online softmax over its slice of
+   vision tokens, writing a partial (m, l, acc).
+2. ``_rotatek_combined_kernel`` — grid (B, H_q). Runs the full-width path over
+   the prompt + text tokens and merges it with the sparse partials in the
+   same online softmax.
 
-Comparing measured numbers at S=12K (image=1k×1, max_num=48 on A100):
+The full-width path is kept out of the sparse kernel on purpose: Triton
+allocates registers for the union of both paths in every split program, which
+lowers occupancy (see the note above ``_rotatek_sparse_kernel``).
 
-    method   triton_attn (ms)   bandwidth efficiency
-    dense       0.158            ~20% of HBM peak (typical Triton)
-    rotatek     0.323            ~6%  of HBM peak  (~3× worse than dense)
-
-That gap was entirely on the rotatek kernel: it reads LESS memory than
-dense (truncated K) yet ran longer. Splitting the kernels lets the sparse
-path stay register-lean.
-
-Layout
-------
-1. `_rotatek_prelude_kernel` — grid (B, H_q). Computes
-       q_sparse[b, h, :] = q_full[b, h, :] @ R_partial[b, kv_h, :, :]
-       bias_val[b, h]    = q_full[b, h, :] · δμ[b, kv_h, :]   (if HAS_BIAS)
-   Writes both into HBM scratch buffers. R is loaded once per (b, h)
-   instead of NUM_SPLITS times.
-
-2. `_rotatek_sparse_kernel` — grid (B, H_q, NUM_SPLITS). Each program
-   processes its slice of vision tokens against q_sparse / bias_val.
-   No q_full in the inner loop → register-lean → high occupancy.
-
-3. `_rotatek_full_kernel` — grid (B, H_q). Each program iterates the
-   prompt + text tokens at full D against q_full. Tiny task (~80 tokens
-   total), but kept separate from sparse so its register burden doesn't
-   bleed.
-
-4. `_splitk_merge_kernel` (imported, unchanged) — grid (B, H_q). Merges
-   NUM_SPLITS sparse partials + 1 full partial = (NUM_SPLITS + 1) partials
-   into the final output.
-
-Public entry-point: `rotatek_decode_fused_triton(...)`. Same signature.
+Public entry point: ``rotatek_decode_fused_triton``.
 """
 from __future__ import annotations
 
 import math
-from typing import Tuple
-
-from typing import Dict
+from typing import Dict, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from rotatek.kernels.sparse_channel_flash_decoding import (
-    _splitk_merge_kernel,
-    _next_power_of_2,
-)
+from rotatek.kernels.full_channel_flash_decoding import _next_power_of_2
 
 
 # ---------------------------------------------------------------------------
@@ -102,67 +68,6 @@ def _get_decode_buffers(bsz: int, heads: int, head_dim: int,
         bufs = (partial_m, partial_l, partial_acc, out)
         _DECODE_BUFFER_CACHE[key] = bufs
     return bufs
-
-
-# ---------------------------------------------------------------------------
-# Prelude: per-(b, h) compute of q_sparse and bias_val.
-# ---------------------------------------------------------------------------
-
-@triton.jit
-def _rotatek_prelude_kernel(
-    q_full_ptr,
-    R_ptr,                      # [B, H_kv, D, D_keep]
-    delta_mu_ptr,               # [B, H_kv, D] (read only when HAS_BIAS=1)
-    q_sparse_out_ptr,           # [B, H_q, D_keep] fp32
-    bias_out_ptr,               # [B, H_q]        fp32
-    # Q strides
-    stride_qf_b, stride_qf_h, stride_qf_d,
-    # R strides
-    stride_R_b, stride_R_h, stride_R_d, stride_R_k,
-    # δμ strides
-    stride_dm_b, stride_dm_h, stride_dm_d,
-    # q_sparse output strides
-    stride_qs_b, stride_qs_h, stride_qs_k,
-    # bias_val output strides
-    stride_bv_b, stride_bv_h,
-    head_dim, head_dim_keep,
-    HAS_BIAS: tl.constexpr,
-    NUM_KV_GROUPS: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_DK: tl.constexpr,
-):
-    pid_b = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    kv_h = pid_h // NUM_KV_GROUPS
-
-    offs_d = tl.arange(0, BLOCK_D)
-    offs_k = tl.arange(0, BLOCK_DK)
-    d_mask = offs_d < head_dim
-    dk_mask = offs_k < head_dim_keep
-
-    qf_base = q_full_ptr + pid_b * stride_qf_b + pid_h * stride_qf_h
-    q = tl.load(qf_base + offs_d * stride_qf_d, mask=d_mask, other=0.0).to(tl.float32)
-
-    R_base = R_ptr + pid_b * stride_R_b + kv_h * stride_R_h
-    R_tile = tl.load(
-        R_base + offs_d[:, None] * stride_R_d + offs_k[None, :] * stride_R_k,
-        mask=d_mask[:, None] & dk_mask[None, :], other=0.0,
-    ).to(tl.float32)
-    q_sparse = tl.sum(q[:, None] * R_tile, axis=0)
-    q_sparse = tl.where(dk_mask, q_sparse, 0.0)
-
-    qs_base = q_sparse_out_ptr + pid_b * stride_qs_b + pid_h * stride_qs_h
-    tl.store(qs_base + offs_k * stride_qs_k, q_sparse, mask=dk_mask)
-
-    if HAS_BIAS:
-        dm_base = delta_mu_ptr + pid_b * stride_dm_b + kv_h * stride_dm_h
-        dm = tl.load(
-            dm_base + offs_d * stride_dm_d, mask=d_mask, other=0.0,
-        ).to(tl.float32)
-        bias_val = tl.sum(q * dm, axis=0)
-    else:
-        bias_val = tl.zeros([], dtype=tl.float32)
-    tl.store(bias_out_ptr + pid_b * stride_bv_b + pid_h * stride_bv_h, bias_val)
 
 
 # ---------------------------------------------------------------------------

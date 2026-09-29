@@ -1,12 +1,9 @@
 """ThinK channel-pruning math.
 
 Per-head channel scoring + compact gather, with an optional
-torch.compile path gated by the ``THINK_COMPILE`` env var.
-
-The cluster-level orchestration (window selection, calibration
-accumulators, etc.) lives in
-``lmms_eval.models.model_utils.kv_pruning_utils``; this module owns
-just the pure-tensor algorithm.
+torch.compile path gated by the ``THINK_COMPILE`` env var. The
+per-layer orchestration lives in
+``lmms_eval.models.model_utils.kv_pruning_utils``.
 """
 from __future__ import annotations
 
@@ -65,8 +62,8 @@ def think_score_and_compact(
     return K_compact, keep_mask
 
 
-# Optional torch.compile path. Gated by `THINK_COMPILE` env var. Mirrors
-# `SPARK_COMPILE` (methods/spark.py) and `ROTATEK_COMPILE` (methods/rotatek/jacobi.py).
+# THINK_COMPILE=default wraps the scoring in torch.compile (the latency
+# sweeps set it), as SPARK_COMPILE / ROTATEK_COMPILE do for the others.
 _THINK_COMPILE_MODE = os.environ.get("THINK_COMPILE", "").strip().lower()
 if _THINK_COMPILE_MODE in ("1", "default", "true", "reduce", "reduce-overhead"):
     # Default inductor mode only — `reduce-overhead` would alias the

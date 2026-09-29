@@ -9,8 +9,6 @@
 # ------------------------------------------------------------------------
 
 import math
-from typing import List, Optional, Union
-
 import torch
 import torch.nn as nn
 
@@ -20,10 +18,7 @@ from transformers.models.llava_next.modeling_llava_next import (
 )
 from transformers.models.auto import AutoModel
 
-from lmms_eval.models.model_utils.llava_next.llama_fastv import (
-    LlamaFastVForCausalLM,
-    _stamp_fastv_defaults,
-)
+from lmms_eval.models.model_utils.llava_next.llama_fastv import LlamaFastVForCausalLM
 
 __all__ = ["LlavaNextFastVForConditionalGeneration"]
 
@@ -34,8 +29,6 @@ class LlavaNextFastVForConditionalGeneration(LlavaNextForConditionalGeneration):
     pipeline is unchanged."""
 
     def __init__(self, config: LlavaNextConfig):
-        _stamp_fastv_defaults(config.text_config)
-
         # Mirror super().__init__ but swap AutoModelForCausalLM with ours.
         super(LlavaNextForConditionalGeneration, self).__init__(config)
         self.vision_tower = AutoModel.from_config(config.vision_config)

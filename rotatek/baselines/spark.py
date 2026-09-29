@@ -1,53 +1,14 @@
 # Copyright © 2025 Advanced Micro Devices, Inc. All rights reserved.
 #
+"""SparK channel-pruning math (per-token channel selection).
+
+Scores each visual token's channels by ||Q||_2 · K² and keeps the top
+D_keep per token; the pruned channels are filled with their per-token
+mean at decode (see ``kv_pruning_utils.VisionZipCluster.update_spark``).
+"""
+import os
 
 import torch
-
-
-def generate_key_mean_fill(keys, mask):
-    """
-    Mean-based filling for key cache using tensor operations.
-    Strategy: Use mean of pruned (masked-out) dimensions to fill missing positions.
-
-    Args:
-        keys: (bsz, num_heads, seq_len, head_dim)
-        mask: boolean mask where True = kept, False = pruned
-    """
-    bsz, num_heads, seq_len, head_dim = keys.shape
-    recovered_keys = keys.clone()
-    missing_mask = ~mask
-    pruned_mask = ~mask
-
-    token_pruned_counts = pruned_mask.sum(dim=3, keepdim=True)  # (bsz, num_heads, seq_len, 1)
-    token_pruned_means = (keys * pruned_mask).sum(dim=3, keepdim=True) / (token_pruned_counts + 1e-8)  # (bsz, num_heads, seq_len, 1)
-
-    token_fill = token_pruned_means.expand(-1, -1, -1, head_dim)  # (bsz, num_heads, seq_len, head_dim)
-
-    return torch.where(missing_mask, token_fill, recovered_keys).to(keys.dtype)
-
-def generate_key_no_fill(keys, mask):
-    """
-    No filling for key cache — simply zero out pruned dimensions.
-
-    Args:
-        keys: (bsz, num_heads, seq_len, head_dim)
-        mask: boolean mask where True = kept, False = pruned
-    """
-    return keys * mask
-
-def compute_spark_channel_scores(queries, keys):
-    """Compute per-head channel importance scores using SparK's scoring method.
-
-    SparK uses L2 norm of Q across sequence × element-wise K^2 averaged across tokens.
-    Returns [B, H, D] scores compatible with key_pruner_query_driven.
-
-    Args:
-        queries: (bsz, num_heads, seq_len, head_dim)
-        keys:    (bsz, num_heads, seq_len, head_dim) — vision tokens only
-    """
-    q_norm = torch.norm(queries, dim=-2, p=2)       # [B, H, D]
-    k_norm = torch.pow(keys, 2).mean(dim=2)          # [B, H, D]
-    return q_norm * k_norm                            # [B, H, D]
 
 
 def per_token_channel_prune(queries, keys, ratio):
@@ -98,31 +59,12 @@ def per_token_channel_prune(queries, keys, ratio):
     return K_compact, keep_mask, pruned_mean
 
 
-# Optional torch.compile path for SparK's per-token prune. Mirrors
-# RotateK's `ROTATEK_COMPILE` env-var pattern. `reduce-overhead` mode
-# captures the kernel chain as a CUDA graph (big win at B=1) but is
-# sensitive to shape changes; default OFF for safety.
-import os as _os_for_spark
-_SPARK_COMPILE_MODE = _os_for_spark.environ.get("SPARK_COMPILE", "").strip().lower()
+# SPARK_COMPILE=default wraps the prune in torch.compile (the latency sweeps
+# set it). Off by default.
+_SPARK_COMPILE_MODE = os.environ.get("SPARK_COMPILE", "").strip().lower()
 if _SPARK_COMPILE_MODE in ("1", "default", "true", "reduce", "reduce-overhead"):
     # Use default inductor mode only — `reduce-overhead` aliases the
     # function's outputs with CUDA-graph buffers that get overwritten
     # on the next call, silently corrupting `keep_mask` / `pruned_mean`
     # appended to the cluster cache.
     per_token_channel_prune = torch.compile(per_token_channel_prune, dynamic=True)
-
-
-def dynamic_score_selection_norm(queries, keys, key_channel_compression_ratio=0, recovery=True):
-    bsz, num_heads, seq_len, head_dim = keys.shape
-
-    q_norm = torch.norm(queries, dim=-2, p=2).unsqueeze(-2)
-    k_norm = torch.pow(keys, 2)
-    sorted_indices = torch.argsort(k_norm * q_norm, dim=-1, descending=True)
-
-    mask = torch.ones_like(keys, dtype=torch.bool)
-    mask.scatter_(-1, sorted_indices[..., -int(key_channel_compression_ratio * head_dim):], False)
-
-    if recovery:
-        return generate_key_mean_fill(keys, mask)
-    else:
-        return generate_key_no_fill(keys, mask)

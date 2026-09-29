@@ -22,7 +22,7 @@
 # ------------------------------------------------------------------------
 
 import math
-from typing import List, Optional, Tuple, Union
+from typing import List, Union
 
 import torch
 import torch.nn as nn
@@ -30,21 +30,11 @@ import torch.nn as nn
 from transformers.models.llava_next.modeling_llava_next import (
     LlavaNextForConditionalGeneration,
     LlavaNextConfig,
-    LlavaNextCausalLMOutputWithPast,
     image_size_to_num_patches,
 )
 from transformers.models.auto import AutoModel
 
-from lmms_eval.models.model_utils.llava_next.llama_visionzip import (
-    LlamaVisionZipForCausalLM,
-    _stamp_channel_defaults,
-    DEFAULT_CALIBRATION_RESULT_ROOT,
-)
-
-__all__ = [
-    "LlavaNextVisionZipForConditionalGeneration",
-    "DEFAULT_CALIBRATION_RESULT_ROOT",
-]
+from lmms_eval.models.model_utils.llava_next.llama_visionzip import LlamaVisionZipForCausalLM
 
 
 class LlavaNextVisionZipForConditionalGeneration(LlavaNextForConditionalGeneration):
@@ -56,10 +46,6 @@ class LlavaNextVisionZipForConditionalGeneration(LlavaNextForConditionalGenerati
     """
 
     def __init__(self, config: LlavaNextConfig):
-        # Stamp the LLaMA-side knobs onto text_config so the VisionZip forward
-        # sees them regardless of whether they were passed via kwargs.
-        _stamp_channel_defaults(config.text_config)
-
         # Mirror super().__init__ but swap AutoModelForCausalLM with ours.
         super(LlavaNextForConditionalGeneration, self).__init__(config)
         self.vision_tower = AutoModel.from_config(config.vision_config)
@@ -105,8 +91,6 @@ class LlavaNextVisionZipForConditionalGeneration(LlavaNextForConditionalGenerati
         self, image_feature, cur_keep_idx, width, height,
         image_size, image_newline,
     ):
-        from transformers.models.llava_next.modeling_llava_next import unpad_image  # noqa: F401  (parity reference)
-
         num_img, total_patches, feature_dim = image_feature.shape
         num_keep = cur_keep_idx.shape[1]              # 1 (CLS) + dom + ctx
 
@@ -551,84 +535,36 @@ class LlavaNextVisionZipForConditionalGeneration(LlavaNextForConditionalGenerati
 
             image_tok_id = self.config.image_token_index
             inputs_embeds = self.get_input_embeddings()(input_ids)
-            if attention_mask is None:
-                attention_mask = torch.ones_like(input_ids)
 
-            # Per-batch: substitute features at first n_features placeholder
-            # positions, then slice off unused placeholders entirely.
-            new_embeds_list = []
-            new_attn_list = []
-            new_labels_list = []
-            feat_offset = 0
-            for b in range(input_ids.shape[0]):
-                placeholder_pos = (input_ids[b] == image_tok_id).nonzero(as_tuple=True)[0]
-                n_placeholders = placeholder_pos.numel()
-                n_features_raw = int(
-                    feature_lens[b].item() if feature_lens.dim() > 0 else feature_lens.item()
-                )
-                feats_b_raw = image_features_packed[feat_offset:feat_offset + n_features_raw].to(
-                    inputs_embeds.device, inputs_embeds.dtype
-                )
-                feat_offset += n_features_raw
+            # Substitute the pruned features into the placeholder slots and slice
+            # off the unused placeholders (batch size 1, as lmms-eval runs).
+            assert input_ids.shape[0] == 1, "VisionZip prefill supports batch size 1"
+            placeholder_pos = (input_ids[0] == image_tok_id).nonzero(as_tuple=True)[0]
+            n_placeholders = placeholder_pos.numel()
+            n_features_raw = int(feature_lens[0].item())
+            feats_raw = image_features_packed[:n_features_raw].to(inputs_embeds.device, inputs_embeds.dtype)
 
-                # Cap features at placeholder count. At light pruning (high
-                # dominant_ratio) our restore output (spatial dom + newlines +
-                # per-tile CLS + contextual) exceeds the original placeholder
-                # count because per-tile CLS / contextual are *appended* tokens
-                # that don't have placeholder slots in input_ids. Drop the
-                # tail (CLS / contextual extras) when we overrun.
-                n_features = min(n_features_raw, n_placeholders)
-                feats_b = feats_b_raw[:n_features]
+            # Cap features at placeholder count. At light pruning (high
+            # dominant_ratio) our restore output (spatial dom + newlines +
+            # per-tile CLS + contextual) exceeds the original placeholder
+            # count because per-tile CLS / contextual are *appended* tokens
+            # that don't have placeholder slots in input_ids. Drop the
+            # tail (CLS / contextual extras) when we overrun.
+            n_features = min(n_features_raw, n_placeholders)
 
-                # Substitute at the first n_features image positions
-                embeds_b = inputs_embeds[b].clone()
-                kept_image_pos = placeholder_pos[:n_features]
-                embeds_b[kept_image_pos] = feats_b
+            # Substitute at the first n_features image positions
+            embeds = inputs_embeds[0].clone()
+            embeds[placeholder_pos[:n_features]] = feats_raw[:n_features]
 
-                # Build keep_mask: drop excess placeholder positions only when
-                # we under-shoot (heavy pruning). At light pruning we capped
-                # features instead, so all placeholders stay.
-                keep_mask = torch.ones_like(input_ids[b], dtype=torch.bool)
-                if n_placeholders > n_features:
-                    keep_mask[placeholder_pos[n_features:]] = False
+            # Drop excess placeholder positions only when we under-shoot
+            # (heavy pruning). At light pruning we capped features instead,
+            # so all placeholders stay.
+            keep_mask = torch.ones_like(input_ids[0], dtype=torch.bool)
+            if n_placeholders > n_features:
+                keep_mask[placeholder_pos[n_features:]] = False
 
-                new_embeds_list.append(embeds_b[keep_mask])
-                new_attn_list.append(attention_mask[b][keep_mask])
-                if labels is not None:
-                    new_labels_list.append(labels[b][keep_mask])
-
-            # batch_size=1 fast path (lmms-eval). Multi-batch: right-pad.
-            if len(new_embeds_list) == 1:
-                inputs_embeds = new_embeds_list[0].unsqueeze(0)
-                attention_mask = new_attn_list[0].unsqueeze(0)
-                if new_labels_list:
-                    labels = new_labels_list[0].unsqueeze(0)
-            else:
-                max_len = max(t.shape[0] for t in new_embeds_list)
-                pad_id = self.pad_token_id if self.pad_token_id >= 0 else 0
-                pad_embed = self.get_input_embeddings()(
-                    torch.tensor([pad_id], device=inputs_embeds.device)
-                )
-                padded_embeds, padded_attn = [], []
-                for emb, am in zip(new_embeds_list, new_attn_list):
-                    pad_n = max_len - emb.shape[0]
-                    if pad_n > 0:
-                        emb = torch.cat([emb, pad_embed.expand(pad_n, -1)], dim=0)
-                        am = torch.cat([am, torch.zeros(pad_n, dtype=am.dtype, device=am.device)])
-                    padded_embeds.append(emb)
-                    padded_attn.append(am)
-                inputs_embeds = torch.stack(padded_embeds, dim=0)
-                attention_mask = torch.stack(padded_attn, dim=0)
-                if new_labels_list:
-                    padded_labels = []
-                    for lb in new_labels_list:
-                        pad_n = max_len - lb.shape[0]
-                        if pad_n > 0:
-                            lb = torch.cat(
-                                [lb, torch.full((pad_n,), -100, dtype=lb.dtype, device=lb.device)]
-                            )
-                        padded_labels.append(lb)
-                    labels = torch.stack(padded_labels, dim=0)
+            inputs_embeds = embeds[keep_mask].unsqueeze(0)
+            attention_mask = attention_mask[0][keep_mask].unsqueeze(0)
 
             # Skip super's image processing; sequence length is now the pruned
             # length. position_ids / cache_position fall back to auto-compute

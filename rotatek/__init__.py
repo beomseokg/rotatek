@@ -1,23 +1,15 @@
-"""RotateK channel-pruning method.
+"""RotateK: rotation-aligned Key channel pruning for VLM KV caches.
 
-Online PCA-aligned channel pruning for visual KV caches.
-
-Submodules:
-    decode  -- public attention-decode entrypoints (`rotatek_decode_fused`,
-               `rotatek_decode_triton`).
-    kernel  -- the fused Triton phase-1 kernel + launcher
-               (`rotatek_decode_fused_triton`).
-    jacobi  -- GPU power iteration / randomized SVD helpers
-               (`power_iteration_gpu`, `randomized_topk_eigh`).
+    rotation.power_iteration_gpu                     top-k eigenbasis of the Key covariance
+    kernels.fused_decode.rotatek_decode_fused_triton decode over rotated-truncated visual Keys
+    kernels.full_channel_flash_decoding              full-width split-K decode (baselines)
 """
-from rotatek.decode import rotatek_decode_fused, rotatek_decode_triton
+from rotatek.kernels.full_channel_flash_decoding import full_channel_decode_triton
 from rotatek.kernels.fused_decode import rotatek_decode_fused_triton
-from rotatek.rotation import power_iteration_gpu, randomized_topk_eigh
+from rotatek.rotation import power_iteration_gpu
 
 __all__ = [
-    "rotatek_decode_fused",
-    "rotatek_decode_triton",
+    "full_channel_decode_triton",
     "rotatek_decode_fused_triton",
     "power_iteration_gpu",
-    "randomized_topk_eigh",
 ]

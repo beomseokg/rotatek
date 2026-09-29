@@ -1,14 +1,12 @@
 """End-to-end latency benchmark for channel-pruning methods on LLaVA-NeXT.
 
-Mirrors `model_end_to_end_internvl.py` (same SUMMARY format, same hooks
-infrastructure) but adapted for `llava-hf/llama3-llava-next-8b-hf`.
-Inputs are synthetic — random `inputs_embeds` of layout
+Model: `llava-hf/llama3-llava-next-8b-hf`. Inputs are synthetic — random `inputs_embeds` of layout
 `[prompt(30) | vision(--prefill_length) | text(30)]` fed directly to the
 LlamaForCausalLM backbone (vision tower bypassed). Only the vision span
 is channel-pruned.
 
 Usage:
-  python -m latency.model_end_to_end_llava_next \\
+  python scripts/paper/latency/model_end_to_end_llava_next.py \\
       --methods full,think,spark,rotatek \\
       --prefill_length 8k,16k,32k,64k \\
       --batch_sizes 1,2,4 \\
@@ -103,15 +101,9 @@ def _load_visionzip(method: str, channel_ratio: str):
         f"attn_implementation=flash_attention_2,"
         f"channel_ratio={channel_ratio},"
         f"channel_method={method},"
-        f"layer_adaptive_channel_budget=False,"
-        f"channel_reconstruction=off,"
-        f"reconstruction_constant=0.1,"
-        f"custom_kernel=False,"
-        f"decode_attention_backend=triton,"
-        f"calibration_mode=off,"
-        f"offline_calibration_tasks=channel_importance"
+        f"decode_attention_backend=triton"
     )
-    LM = models.get_model("llava_next_visionzip", force_simple=False)
+    LM = models.get_model("llava_next_visionzip")
     lm = LM.create_from_arg_string(
         model_args, {"batch_size": 1, "max_batch_size": None, "device": "cuda:0"},
     )
@@ -483,8 +475,7 @@ def measure_one(method: str, prefill_length: int,
                           channel_ratio: str, max_new_tokens: int,
                           batch_size: int = 1, n_repeats: int = 1,
                           mem_trace: bool = False,
-                          profile_breakdown: bool = False,
-                          profile_mode: str = "cuda") -> dict:
+                          profile_breakdown: bool = False) -> dict:
     """Synthetic-input measurement at exact `prefill_length` prefill length.
 
     Skips the vision tower; feeds random inputs_embeds of shape
@@ -557,28 +548,12 @@ def measure_one(method: str, prefill_length: int,
 
     breakdown_by_layer: Dict[int, Dict[str, float]] = {}
     if profile_breakdown:
-        # Lazy import: only loaded when --profile_breakdown is set, since the
-        # qwen module imports triton kernels.
-        from lmms_eval.models.model_utils.qwen.qwen2_5vl_visionzip import (
-            run_custom_decode_kernel,
-        )
-
-        print(
-            f"[breakdown] running profile pass (mode={profile_mode}, "
-            "excluded from timing)...",
-            flush=True,
-        )
+        print("[breakdown] running profile pass (excluded from timing)...", flush=True)
         attn_cfg = _attention_config(model)
         n_layers = LLAVA_NEXT_CFG["num_layers"]
         attn_cfg._decode_profile = True
-        attn_cfg._decode_profile_mode = profile_mode
         attn_cfg._decode_profile_layers = set(range(n_layers))
-        attn_cfg._decode_timings = None
         attn_cfg._decode_timings_by_layer = None
-        run_custom_decode_kernel._profile_kernel = True
-        run_custom_decode_kernel._profile_layer_idx = None
-        run_custom_decode_kernel._kernel_timings = None
-        run_custom_decode_kernel._kernel_timings_by_layer = None
 
         try:
             _ = _run_generation(
@@ -587,7 +562,6 @@ def measure_one(method: str, prefill_length: int,
             torch.cuda.synchronize()
         finally:
             attn_cfg._decode_profile = False
-            run_custom_decode_kernel._profile_kernel = False
 
         breakdown_by_layer = _aggregate_decode_breakdown(model)
         _print_breakdown_table(breakdown_by_layer)
@@ -765,16 +739,6 @@ def main():
             "`decode_breakdown_by_layer` of each result row."
         ),
     )
-    parser.add_argument(
-        "--profile_mode", choices=["cuda", "wall"], default="cuda",
-        help=(
-            "Timing primitive for `--profile_breakdown`. 'cuda' uses "
-            "torch.cuda.Event (low overhead, GPU-side). 'wall' calls "
-            "torch.cuda.synchronize()+time.perf_counter() at every stage "
-            "boundary (serializes the pipeline; reports pure wall-clock per "
-            "stage)."
-        ),
-    )
     args = parser.parse_args()
 
     os.makedirs(args.log_dir, exist_ok=True)
@@ -845,7 +809,6 @@ def main():
                         args.decoding_length, batch_size=B,
                         n_repeats=args.n_repeats,
                         profile_breakdown=args.profile_breakdown,
-                        profile_mode=args.profile_mode,
                     )
                     rows.append(r)
                 except torch.cuda.OutOfMemoryError as e:

@@ -24,13 +24,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ------------------------------------------------------------------------
-# Modified from Transformers 4.49.0 
+# Modified from Transformers 4.49.0
 # Copyright 2025 Senqiao Yang
+#
+# RotateK changes relative to transformers 4.49.0 modeling_qwen2_5_vl.py:
+#   * Vision attention / VisionBlock / VisionTransformer: the last ViT block
+#     also returns its attention map and Keys, which VisionZip scores tokens with.
+#   * Qwen2_5_VLFlashAttention2.forward: channel-pruned KV cache (prefill) and
+#     the matching decode paths (ThinK / SparK recovery, RotateK fused kernel,
+#     optional Triton decode for latency runs).
+#   * Qwen2_5_VLForConditionalGeneration: VisionZip token selection + merge,
+#     visual-span bookkeeping, and the swap to the span-splitting DynamicCache.
+# Everything else is the upstream code unchanged.
 # ------------------------------------------------------------------------
 
-import csv
 import math
-from time import perf_counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -73,458 +81,26 @@ else:
     flash_attn_varlen_func = None
 
 
-### ThinK
-from lmms_eval.models.model_utils.kv_pruning_utils import init_visionzip, recover_cache
+# RotateK
+from lmms_eval.models.model_utils.kv_pruning_utils import init_visionzip
 from lmms_eval.models.model_utils.cache_utils import Cache, DynamicCache
-
-### Plot
-import os
-import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.patches import Patch
+from rotatek.kernels.fused_decode import rotatek_decode_fused_triton
+from rotatek.kernels.full_channel_flash_decoding import full_channel_decode_triton
 
 
 logger = logging.get_logger(__name__)
 
-DEFAULT_CALIBRATION_RESULT_ROOT = (
-    "./results/Qwen2.5_VL_7B"
-)
 
-
-def _require_calibration_dominant_ratio(config):
-    if not hasattr(config, "dominant_ratio"):
-        raise ValueError("config.dominant_ratio must be provided")
-    try:
-        return round(float(config.dominant_ratio), 2)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid dominant_ratio: {getattr(config, 'dominant_ratio', None)}") from exc
-
-
-def load_channel_importance_calibration(base_dir, num_layers, dtype=torch.float32):
-    layerwise = {}
-    for layer_idx in range(num_layers):
-        csv_path = os.path.join(base_dir, f"layer_{layer_idx:02d}_mmstar_calibration.csv")
-        if not os.path.exists(csv_path):
-            continue
-
-        rows = []
-        max_head_idx = -1
-        max_channel_idx = -1
-
-        with open(csv_path, "r", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                head_idx = int(row["head_idx"])
-                channel_idx = int(row["channel_idx"])
-                score = float(row["avg_score"])
-                rows.append((head_idx, channel_idx, score))
-                max_head_idx = max(max_head_idx, head_idx)
-                max_channel_idx = max(max_channel_idx, channel_idx)
-
-        if not rows:
-            continue
-
-        scores = torch.zeros(max_head_idx + 1, max_channel_idx + 1, dtype=dtype)
-        for head_idx, channel_idx, score in rows:
-            scores[head_idx, channel_idx] = score
-
-        layerwise[layer_idx] = scores
-
-    return layerwise
-
-
-# Module-level import for sparse decode kernels (avoid per-call import overhead)
-from rotatek.kernels.sparse_channel_flash_decoding import (
-        _next_power_of_2,
-        _prepare_q_kernel,
-        sparse_channel_decode_triton as _sparse_decode_triton,
-        sparse_channel_decode_triton_direct as _sparse_decode_triton_direct,
-)
-
-
-def _get_decode_kernel_timings():
-    layer_idx = getattr(run_custom_decode_kernel, '_profile_layer_idx', None)
-    if layer_idx is None:
-        layer_idx = -1
-    timings_by_layer = getattr(run_custom_decode_kernel, '_kernel_timings_by_layer', None)
-    if timings_by_layer is None:
-        timings_by_layer = {}
-        run_custom_decode_kernel._kernel_timings_by_layer = timings_by_layer
-    timings = timings_by_layer.get(layer_idx)
-    if timings is None:
-        timings = {
-            'triton_ms': [],
-            'cuda_ms': [],
-            'cache_setup_ms': [],
-            'index_setup_ms': [],
-            'static_setup_ms': [],
-            'view_setup_ms': [],
-            'q_prepare_ms': [],
-            'q_alloc_ms': [],
-            'full_prepare_ms': [],
-            'pre_backend_ms': [],
-            'post_backend_ms': [],
-            'inner_pre_backend_ms': [],
-            'inner_post_backend_ms': [],
-            '_pending_events': [],
-            'head_dim_keep': [],
-            'pruned_dim': [],
-            'seq_sparse': [],
-            'seq_prompt': [],
-            'seq_text': [],
-            'num_splits': [],
-            'block_k': [],
-            'block_p': [],
-        }
-        timings_by_layer[layer_idx] = timings
-    return timings
-
-
-def run_dense_decode_kernel(
-    query_states,
-    key_states,
-    value_states,
-    num_key_value_groups,
-    attention_mask=None,
-):
-    """Full-channel decode attention via the dedicated Triton split-K
-    kernel (`kernel/full_channel_flash_decoding_triton.py`). Used by
-    Full / ThinK / SparK after they recover full-D K.
-    """
-    from rotatek.kernels.full_channel_flash_decoding import full_channel_decode_triton
-
-    q = query_states.squeeze(-2)
-    _profile_kernel = getattr(run_custom_decode_kernel, '_profile_kernel', False)
-    if _profile_kernel:
-        _k_evt = torch.cuda.Event(enable_timing=True)
-        _k_evt.record()
-
-    attn_output = full_channel_decode_triton(
-        q=q,
-        k=key_states,
-        v=value_states,
-        num_kv_groups=num_key_value_groups,
+def run_dense_decode_kernel(query_states, key_states, value_states, num_key_value_groups):
+    """Full-width decode attention through the Triton split-K kernel. With
+    decode_attention_backend="triton" (the latency runs), Full / ThinK /
+    SparK decode through this so every method is timed on Triton kernels."""
+    return full_channel_decode_triton(
+        q=query_states.squeeze(-2), k=key_states, v=value_states, num_kv_groups=num_key_value_groups,
     )
-
-    if _profile_kernel:
-        _k_done = torch.cuda.Event(enable_timing=True)
-        _k_done.record()
-        _kernel_timings = _get_decode_kernel_timings()
-        _kernel_timings.setdefault('_pending_dense_events', [])
-        _kernel_timings['_pending_dense_events'].append({
-            'triton_start': _k_evt,
-            'triton_end': _k_done,
-        })
-
-    return attn_output
-
-
-def run_custom_decode_kernel(
-    query_states,
-    key_pruned,
-    value_states,
-    key_prompt,
-    text_key_states,
-    mask,
-    keep_idx,
-    num_key_value_groups,
-    head_dim,
-    attention_mask=None,
-    supplementary_matrix=None,
-    channel_reconstruction="off",
-):
-    # --- shape validation (disabled for speed, uncomment for debugging) ---
-    # if query_states.dim() != 4:
-    #     raise ValueError(f"query_states must be 4D, got {tuple(query_states.shape)}")
-    # if key_pruned.dim() != 4:
-    #     raise ValueError(f"key_pruned must be 4D, got {tuple(key_pruned.shape)}")
-    # if mask.dim() != 3:
-    #     raise ValueError(f"mask must be 3D, got {tuple(mask.shape)}")
-
-    bsz, num_heads, _, _ = query_states.shape
-    _, _, sparse_seq_len, kept_dim = key_pruned.shape
-
-    _profile_kernel = getattr(run_custom_decode_kernel, '_profile_kernel', False)
-    if _profile_kernel:
-        _cache_setup_evt = torch.cuda.Event(enable_timing=True)
-        _cache_setup_evt.record()
-
-    if _profile_kernel:
-        _index_setup_evt = torch.cuda.Event(enable_timing=True)
-        _index_setup_evt.record()
-
-    has_matrix_recon = supplementary_matrix is not None
-    pruned_idx_t = None
-    w_t_t = None
-    recon_bias_t = None
-    pruned_dim = 0
-
-    if has_matrix_recon:
-        _sup_cache = getattr(run_custom_decode_kernel, '_sup_cache', {})
-        _sup_key = (
-            supplementary_matrix["weight"].data_ptr(),
-            supplementary_matrix["weight"].shape,
-            supplementary_matrix["keep_idx"].data_ptr(),
-            supplementary_matrix["pruned_idx"].data_ptr(),
-            supplementary_matrix["bias"].data_ptr(),
-            bsz,
-            query_states.device,
-            query_states.dtype,
-        )
-        if _sup_key not in _sup_cache:
-            keep_idx_t = supplementary_matrix["keep_idx"].to(
-                device=query_states.device, dtype=torch.long,
-            ).contiguous()
-            if keep_idx_t.dim() == 2:
-                keep_idx_t = keep_idx_t.unsqueeze(0).expand(bsz, -1, -1).contiguous()
-            elif keep_idx_t.dim() == 3 and keep_idx_t.shape[0] != bsz:
-                keep_idx_t = keep_idx_t[:1].expand(bsz, -1, -1).contiguous()
-
-            w_t_t = supplementary_matrix["weight"].to(
-                device=query_states.device, dtype=query_states.dtype,
-            ).transpose(-2, -1).contiguous()  # [H_kv, pruned_dim, D_keep]
-            pruned_idx_t = supplementary_matrix["pruned_idx"].to(
-                device=query_states.device, dtype=torch.long,
-            ).contiguous()  # [H_kv, pruned_dim]
-            recon_bias_t = supplementary_matrix["bias"].to(
-                device=query_states.device, dtype=query_states.dtype,
-            ).contiguous()  # [H_kv, pruned_dim]
-            if len(_sup_cache) >= 128:
-                _sup_cache.clear()
-            _sup_cache[_sup_key] = (keep_idx_t, pruned_idx_t, w_t_t, recon_bias_t)
-            run_custom_decode_kernel._sup_cache = _sup_cache
-        kv_keep_idx, pruned_idx_t, w_t_t, recon_bias_t = _sup_cache[_sup_key]
-        pruned_dim = pruned_idx_t.shape[-1]
-    else:
-        if keep_idx is not None:
-            kv_keep_idx = keep_idx
-        else:
-            # Compatibility fallback for older caches that do not store keep_idx.
-            keep_mask = mask if mask.dtype == torch.bool else mask.to(dtype=torch.bool)
-            kv_keep_idx = torch.argsort(
-                keep_mask.to(torch.int32), dim=-1, descending=True, stable=True,
-            )[..., :kept_dim].contiguous()  # [B, H_kv, D_keep]
-        pruned_idx_t = kv_keep_idx  # dummy, not used without recon
-        w_t_t = kv_keep_idx         # dummy
-        recon_bias_t = kv_keep_idx  # dummy
-
-    if _profile_kernel:
-        _index_setup_done = torch.cuda.Event(enable_timing=True)
-        _index_setup_done.record()
-        _static_setup_evt = torch.cuda.Event(enable_timing=True)
-        _static_setup_evt.record()
-
-    k_sparse = key_pruned
-    prompt_len = key_prompt.shape[-2] if key_prompt is not None else 0
-    text_len = text_key_states.shape[-2] if text_key_states is not None else 0
-    _profile_num_splits = max(1, min((sparse_seq_len + 64 - 1) // 64, 64))
-    _profile_block_k = _next_power_of_2(kept_dim)
-    _profile_block_p = _next_power_of_2(pruned_dim) if pruned_dim > 0 else 1
-
-    if _profile_kernel:
-        _static_setup_done = torch.cuda.Event(enable_timing=True)
-        _static_setup_done.record()
-        _view_setup_evt = torch.cuda.Event(enable_timing=True)
-        _view_setup_evt.record()
-
-    q_full = query_states.squeeze(-2)  # [bsz, num_heads, head_dim]
-
-    if _profile_kernel:
-        _view_setup_done = torch.cuda.Event(enable_timing=True)
-        _view_setup_done.record()
-        _cache_setup_done = torch.cuda.Event(enable_timing=True)
-        _cache_setup_done.record()
-
-    if _profile_kernel:
-        _backend_evt = torch.cuda.Event(enable_timing=True)
-        _pre_backend_evt = torch.cuda.Event(enable_timing=True)
-        _post_backend_evt = torch.cuda.Event(enable_timing=True)
-        _backend_evt.record()
-        _pre_backend_evt.record()
-        _backend_events_by_layer = getattr(run_custom_decode_kernel, '_backend_events_by_layer', None)
-        if _backend_events_by_layer is None:
-            _backend_events_by_layer = {}
-            run_custom_decode_kernel._backend_events_by_layer = _backend_events_by_layer
-        _backend_events_by_layer[getattr(run_custom_decode_kernel, '_profile_layer_idx', -1)] = (
-            _backend_evt,
-            None,
-        )
-
-    attn_output, _, _ = _sparse_decode_triton_direct(
-        q_full=q_full,
-        keep_idx=kv_keep_idx,
-        k_prompt=key_prompt,
-        k_text=text_key_states,
-        k_sparse=k_sparse,
-        v_all=value_states,
-        pruned_idx=pruned_idx_t if has_matrix_recon else None,
-        w_t=w_t_t if has_matrix_recon else None,
-        recon_bias=recon_bias_t if has_matrix_recon else None,
-        num_kv_groups=num_key_value_groups,
-    )
-
-    if _profile_kernel:
-        _backend_done = torch.cuda.Event(enable_timing=True)
-        _backend_done.record()
-        _post_backend_evt.record()
-        _backend_events_by_layer = getattr(run_custom_decode_kernel, '_backend_events_by_layer', None)
-        if _backend_events_by_layer is not None:
-            _backend_events_by_layer[getattr(run_custom_decode_kernel, '_profile_layer_idx', -1)] = (
-                _backend_evt,
-                _backend_done,
-            )
-        _kernel_timings = _get_decode_kernel_timings()
-        _kernel_timings.setdefault('_pending_events', [])
-        _kernel_timings['_pending_events'].append({
-            'cache_setup_evt': _cache_setup_evt,
-            'cache_setup_done': _cache_setup_done,
-            'index_setup_evt': _index_setup_evt,
-            'index_setup_done': _index_setup_done,
-            'static_setup_evt': _static_setup_evt,
-            'static_setup_done': _static_setup_done,
-            'view_setup_evt': _view_setup_evt,
-            'view_setup_done': _view_setup_done,
-            'pre_backend_evt': _pre_backend_evt,
-            'backend_evt': _backend_evt,
-            'backend_done': _backend_done,
-            'post_backend_evt': _post_backend_evt,
-            'head_dim_keep': int(kept_dim),
-            'pruned_dim': int(pruned_dim),
-            'seq_sparse': int(sparse_seq_len),
-            'seq_prompt': int(prompt_len),
-            'seq_text': int(text_len),
-            'num_splits': int(_profile_num_splits),
-            'block_k': int(_profile_block_k),
-            'block_p': int(_profile_block_p),
-        })
-
-    return attn_output
 
 
 _CONFIG_FOR_DOC = "Qwen2_5_VLConfig"
-
-
-import os
-import matplotlib.pyplot as plt
-import numpy as np
-import math
-
-
-def compute_causal_attention_scores(query_states, key_states):
-    """
-    query_states, key_states: [B, H, S, S]
-    return: attention_scores: [B, H, S, S]
-    """
-
-    q = query_states
-    k = key_states
-    B, H, S, D = q.shape
-
-    # Q @ K^T / sqrt(D)
-    attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)  # [B, H, S, S]
-
-    # create causal mask
-    causal_mask = torch.triu(
-        torch.ones(S, S, dtype=torch.bool, device=attn_scores.device),
-        diagonal=1,
-    )  # upper-triangular (j > i)
-
-    # apply mask
-    attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
-
-    # softmax
-    attn_probs = torch.softmax(attn_scores, dim=-1)
-
-    return attn_probs
-
-def visualize_key_states(
-    key_states,
-    layer_idx,
-    rope=False,
-    # save_dir="./results/Channel_Feature_Visualization"
-    save_dir="./results/Channel_Feature_Visualization/Qwen2.5_VL_7B_DocVQA/original"
-):
-    """
-    key_states: (1, num_heads, seq_len, channel)
-    layer_idx: int
-    rope: bool -> whether this visualization is before or after RoPE
-    """
-
-    # tensor → numpy
-    if hasattr(key_states, "detach"):
-        key_states = key_states.to(torch.float32).detach().cpu().numpy()
-
-    _, num_heads, seq_len, channel = key_states.shape
-    os.makedirs(save_dir, exist_ok=True)
-
-    # suffix for file naming
-    rope_tag = "rope" if rope else "no_rope"
-
-    for head_idx in range(num_heads):
-        feat = key_states[0, head_idx]  # (seq_len, channel)
-
-        plt.figure(figsize=(14, 6))
-        plt.imshow(feat, aspect="auto", interpolation="nearest")
-        plt.title(f"Layer {layer_idx} - Head {head_idx} Key States ({rope_tag})")
-        plt.xlabel(f"Channel ({channel})")
-        plt.ylabel(f"Sequence Length ({seq_len})")
-        plt.colorbar()
-
-        # PNG save path
-        save_path = os.path.join(
-            save_dir,
-            f"docvqa_val_lite_eval_dominant_ratio_0.50_contextual_ratio_0.05_layer{layer_idx}_head{head_idx}_{rope_tag}.png"
-        )
-
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
-        plt.close()
-
-        print(f"Saved: {save_path}")
-
-def visualize_query_states(
-    query_states,
-    layer_idx,
-    rope=False,
-    # save_dir="./results/Channel_Feature_Visualization"
-    save_dir="./results/Channel_Feature_Visualization/Qwen2.5_VL_7B_DocVQA/original"
-):
-    """
-    key_states: (1, num_heads, seq_len, channel)
-    layer_idx: int
-    rope: bool -> whether this visualization is before or after RoPE
-    """
-
-    # tensor → numpy
-    if hasattr(query_states, "detach"):
-        query_states = query_states.to(torch.float32).detach().cpu().numpy()
-
-    _, num_heads, seq_len, channel = query_states.shape
-    os.makedirs(save_dir, exist_ok=True)
-
-    # suffix for file naming
-    rope_tag = "rope" if rope else "no_rope"
-
-    for head_idx in range(num_heads):
-        feat = query_states[0, head_idx]  # (seq_len, channel)
-
-        plt.figure(figsize=(14, 6))
-        plt.imshow(feat, aspect="auto", interpolation="nearest")
-        plt.title(f"Layer {layer_idx} - Head {head_idx} Query States ({rope_tag})")
-        plt.xlabel(f"Channel ({channel})")
-        plt.ylabel(f"Sequence Length ({seq_len})")
-        plt.colorbar()
-
-        # PNG save path
-        save_path = os.path.join(
-            save_dir,
-            f"docvqa_val_lite_eval_dominant_ratio_0.50_contextual_ratio_0.05_layer{layer_idx}_head{head_idx}_{rope_tag}_query.png"
-        )
-
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
-        plt.close()
-
-        print(f"Saved: {save_path}")
-
 
 
 class Qwen2_5_VLMLP(nn.Module):
@@ -1346,370 +922,93 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
     ):
         bsz, q_len, _ = hidden_states.size()
 
-
-        def _new_evt():
-            return torch.cuda.Event(enable_timing=True)
-
-        def _elapsed_ms(start_evt, end_evt):
-            if start_evt is None or end_evt is None:
-                return 0.0
-            return start_evt.elapsed_time(end_evt)
-
-
-        # ------------------------------------------------------------------
-        # profiling event placeholders
-        # ------------------------------------------------------------------
-        _evt_qkv_proj_rope_start = _evt_qkv_proj_rope_end = None
-        _evt_cache_update_start = _evt_cache_update_end = None
-        _evt_recovery_start = _evt_recovery_end = None
-        _evt_cat_start = _evt_cat_end = None
-        _evt_custom_kernel_start = _evt_custom_kernel_end = None
-        _evt_transpose_start = _evt_transpose_end = None
-        _evt_attn_start = _evt_attn_end = None
-        _evt_attn_out_start = _evt_attn_out_end = None
-
-        # Legacy layer-0-attention boundary markers. These are intentionally
-        # not used for benchmark phase reporting because they miss pre-model
-        # prefill work such as vision encoding and input preparation.
-        if getattr(self.config, "_decode_profile", False) and self.layer_idx == 0:
-            if q_len > 1:
-                evt = _new_evt()
-                evt.record()
-                self.config._prefill_start_evt = evt
-            elif not hasattr(self.config, "_decode_start_evt"):
-                evt = _new_evt()
-                evt.record()
-                self.config._decode_start_evt = evt
-
-        _profile_layers = getattr(self.config, "_decode_profile_layers", {14})
-        _profile = (
-            getattr(self.config, "_decode_profile", False)
-            and self.layer_idx in _profile_layers
-            and q_len == 1
-        )
-        _kernel_envelope_layers = getattr(self.config, "_kernel_envelope_profile_layers", _profile_layers)
-        _kernel_envelope_profile = (
-            getattr(self.config, "_kernel_envelope_profile", False)
-            and self.layer_idx in _kernel_envelope_layers
-            and q_len == 1
-        )
-        _custom_kernel_event_profile = _profile or _kernel_envelope_profile
-
-        def _record_kernel_envelope_event():
-            if not _kernel_envelope_profile or _evt_custom_kernel_start is None or _evt_custom_kernel_end is None:
-                return
-            _events_by_layer = getattr(self.config, "_kernel_envelope_events_by_layer", None)
-            if _events_by_layer is None:
-                _events_by_layer = {}
-                self.config._kernel_envelope_events_by_layer = _events_by_layer
-            _events_by_layer.setdefault(self.layer_idx, []).append(
-                (_evt_custom_kernel_start, _evt_custom_kernel_end)
-            )
-
-        channel_method = getattr(self.config, "channel_method", "think")
-        channel_ratio = getattr(self.config, "channel_ratio", 0.0)
-
-
+        # RotateK: a fresh pruning cluster per prefill
+        channel_method = self.config.channel_method
+        channel_ratio = self.config.channel_ratio
+        use_triton_decode = getattr(self.config, "decode_attention_backend", "fa2") == "triton"
         if q_len > 1:
             init_visionzip(self)
-
-
-        # ------------------------------------------------------------------
-        # qkv proj + view/transpose + rope
-        # ------------------------------------------------------------------
-        _evt_qkv_proj_start = _evt_qkv_proj_end = None
-        _evt_rope_start = _evt_rope_end = None
-        if _profile:
-            _evt_qkv_proj_start = _new_evt()
-            _evt_qkv_proj_rope_start = _new_evt()
-            _evt_qkv_proj_rope_end = _new_evt()
-            _evt_qkv_proj_start.record()
-            _evt_qkv_proj_rope_start.record()
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
         query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-        key_states_no_rope = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-
-        if _profile:
-            _evt_qkv_proj_end = _new_evt()
-            _evt_qkv_proj_end.record()
-            _evt_rope_start = _new_evt()
-            _evt_rope_start.record()
 
         # Because the input can be padded, the absolute sequence length depends on the max position id.
         cos, sin = position_embeddings
         query_states, key_states = apply_multimodal_rotary_pos_emb(
-            query_states, key_states_no_rope, cos, sin, self.rope_scaling["mrope_section"]
+            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
         )
 
-        if _profile:
-            _evt_rope_end = _new_evt()
-            _evt_rope_end.record()
-            _evt_qkv_proj_rope_end.record()
-
-
-        """ original implementation
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        """
-
-        # GQA: K/V stay at H_kv heads; FA2 and custom kernel handle Q[H_q] × K[H_kv] natively
-        channel_method = getattr(self.config, "channel_method", "think")
-
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-
-            if key_states.shape[-2] > 1: # prefill
-                if channel_ratio == 0.0:
-                    # No channel pruning — store K/V as single tensors each.
-                    # The split-storage path (store_pruned + decode-time
-                    # `cat([key_prompt, key_pruned, text_key])`) over-counts
-                    # the boundary vision token under prompt_seqlen/query_seqlen
-                    # heuristics, producing K/V seqlen mismatch on degenerate
-                    # inputs. Mirrors the FastV adapter pattern.
-                    past_key_value.store_unified(key_states, value_states, self.layer_idx)
-                elif channel_method == "think":
-                    # ThinK: per-head channel pruning + scatter-based recovery at decode
-                    kv_pruned, kv_prompt, kv_text, mask, value_states_compress = self.kv_cluster.update_think(
-                        key_states,
-                        query_states,
-                        value_states,
-                        attention_mask,
-                        num_key_value_groups=self.num_key_value_groups,
-                        calibration_channel_importance=getattr(self, "calibration_channel_importance", None),
-                    )
-                    past_key_value.store_pruned(kv_pruned, kv_prompt, kv_text, mask, value_states_compress, self.layer_idx, cache_kwargs)
+        # RotateK: replaces `past_key_value.update(...)` + repeat_kv. K/V stay at
+        # H_kv heads (FA2 and the Triton kernels take GQA natively). Prefill
+        # attends over the full K/V; only what is cached for decode is pruned.
+        attn_output = None  # set here when a Triton decode kernel runs
+        if q_len > 1:  # prefill
+            if channel_ratio == 0.0:
+                past_key_value.store_unified(key_states, value_states, self.layer_idx)
+            else:
+                update = {"think": self.kv_cluster.update_think,
+                          "spark": self.kv_cluster.update_spark,
+                          "rotatek": self.kv_cluster.update_rotatek}[channel_method]
+                kv_pruned, kv_prompt, kv_text, mask, value_states_compress = update(
+                    key_states, query_states, value_states, attention_mask,
+                    num_key_value_groups=self.num_key_value_groups,
+                )
+                past_key_value.store_pruned(kv_pruned, kv_prompt, kv_text, mask, value_states_compress, self.layer_idx)
+                if channel_method == "think":
                     past_key_value.think_mask.append(self.kv_cluster.current_think_mask)
                 elif channel_method == "spark":
-                    # SparK: per-token channel pruning + mean fill at decode
-                    kv_pruned, kv_prompt, kv_text, mask, value_states_compress = self.kv_cluster.update_spark(
-                        key_states,
-                        query_states,
-                        value_states,
-                        attention_mask,
-                        num_key_value_groups=self.num_key_value_groups,
-                    )
-                    past_key_value.store_pruned(kv_pruned, kv_prompt, kv_text, mask, value_states_compress, self.layer_idx, cache_kwargs)
                     past_key_value.spark_mask.append(self.kv_cluster.current_spark_mask)
                     past_key_value.spark_pruned_mean.append(self.kv_cluster.current_spark_pruned_mean)
-                elif channel_method == "rotatek":
-                    # RotateK: per-image PCA rotation, store rank-D_keep projection in original basis
-                    kv_pruned, kv_prompt, kv_text, mask, value_states_compress = self.kv_cluster.update_rotatek(
-                        key_states,
-                        query_states,
-                        value_states,
-                        attention_mask,
-                        num_key_value_groups=self.num_key_value_groups,
-                        calibration_rotation_R_partial=getattr(self, "calibration_rotation_R_partial", None),
-                    )
-                    past_key_value.store_pruned(kv_pruned, kv_prompt, kv_text, mask, value_states_compress, self.layer_idx, cache_kwargs)
-                    # In truncated storage mode (ROTATEK_STORAGE=truncated)
-                    # kv_pruned is [S_v, D_keep] and decode needs R_partial to
-                    # rotate Q. δμ recovers the full-mode mean-shift on vision
-                    # logits. Both are None in full-storage mode.
-                    past_key_value.rotatek_rotations.append(
-                        self.kv_cluster.current_rotatek_R_partial
-                    )
-                    past_key_value.rotatek_means.append(
-                        self.kv_cluster.current_rotatek_delta_mu
-                    )
                 else:
-                    raise ValueError(f"Unsupported channel_method: {channel_method}")
-
-                # Method-agnostic rotation_matrix calibration hook: accumulates
-                # K^T K (centered) for any channel_method when collect mode is
-                # on with rotation_matrix task. Mirrors InternVL adapter.
-                from lmms_eval.models.model_utils.kv_pruning_utils import (
-                    _maybe_accumulate_rotation_matrix_calibration as _rk_accum_rot,
+                    past_key_value.rotatek_rotations.append(self.kv_cluster.current_rotatek_R_partial)
+                    past_key_value.rotatek_means.append(self.kv_cluster.current_rotatek_delta_mu)
+        elif channel_ratio == 0.0:  # decode, uncompressed
+            key_states, value_states = past_key_value.update_unified(key_states, value_states, self.layer_idx)
+            if use_triton_decode:
+                attn_output = run_dense_decode_kernel(query_states, key_states, value_states, self.num_key_value_groups)
+        else:  # decode, compressed
+            text_key_states, value_states, key_pruned, key_prompt, mask = past_key_value.update(
+                key_states, value_states, self.layer_idx
+            )
+            if channel_method == "rotatek":
+                # Keys stay rotated and truncated; the fused kernel rotates q
+                # and adds the δμ bias itself.
+                s_prompt, s_vision = key_prompt.shape[-2], key_pruned.shape[-2]
+                q_squeezed = query_states.squeeze(2)
+                attn_output, _, _ = rotatek_decode_fused_triton(
+                    q_full=q_squeezed,
+                    R_partial=past_key_value.rotatek_rotations[self.layer_idx],
+                    delta_mu=past_key_value.rotatek_means[self.layer_idx],
+                    k_full=torch.cat([key_prompt, text_key_states], dim=-2),
+                    v_full=torch.cat([value_states[:, :, :s_prompt], value_states[:, :, s_prompt + s_vision:]], dim=-2),
+                    mask_full=torch.ones(bsz, s_prompt + text_key_states.shape[-2],
+                                         device=q_squeezed.device, dtype=torch.uint8),
+                    k_sparse=key_pruned,
+                    v_sparse=value_states[:, :, s_prompt:s_prompt + s_vision],
+                    num_kv_groups=self.num_key_value_groups,
                 )
-                _rk_accum_rot(self.kv_cluster, key_states)
-
-
-            else: # decoding
-                if _profile:
-                    _evt_cache_update_start = _new_evt()
-                    _evt_cache_update_end = _new_evt()                    
-                    _evt_cache_update_start.record()
-
-                if channel_ratio == 0.0:
-                    # Unified-storage path: K/V live in `key_cache_unified`
-                    # / `value_cache` as single tensors. Bypass split-storage
-                    # update (which over-counts the prompt/vision/text
-                    # boundary token, producing K/V seqlen mismatch).
-                    key_states, value_states = past_key_value.update_unified(
-                        key_states, value_states, self.layer_idx,
-                    )
+            else:
+                # ThinK / SparK recover full-width visual Keys for dense attention
+                bsz_r, h_kv, seq_r = key_pruned.shape[:3]
+                if channel_method == "think":
+                    # pruned channels are zero
+                    think_mask = past_key_value.think_mask[self.layer_idx]  # [B, H_kv, D]
+                    recovered_key_states = torch.zeros(bsz_r, h_kv, seq_r, self.head_dim,
+                                                       dtype=key_pruned.dtype, device=key_pruned.device)
+                    recovered_key_states[think_mask.unsqueeze(2).expand(-1, -1, seq_r, -1)] = key_pruned.reshape(-1)
                 else:
-                    text_key_states, value_states, key_pruned, key_prompt, mask = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-                if _profile:
-                    _evt_cache_update_end.record()
-
-                if channel_ratio == 0.0:
-                    # K/V already aligned by `update_unified` above. Optional
-                    # Triton dense kernel; otherwise fall through to FA2 below.
-                    use_dense_triton = (
-                        getattr(self.config, "decode_attention_backend", "fa2") == "triton"
-                    )
-
-                    if use_dense_triton:
-                        if _custom_kernel_event_profile:
-                            _evt_custom_kernel_start = _new_evt()
-                            _evt_custom_kernel_end = _new_evt()
-                            _evt_custom_kernel_start.record()
-
-                        run_custom_decode_kernel._profile_kernel = _profile
-                        run_custom_decode_kernel._profile_layer_idx = self.layer_idx if _profile else None
-                        attn_output = run_dense_decode_kernel(
-                            query_states=query_states,
-                            key_states=key_states,
-                            value_states=value_states,
-                            num_key_value_groups=self.num_key_value_groups,
-                            attention_mask=attention_mask,
-                        )
-
-                        if _custom_kernel_event_profile:
-                            _evt_custom_kernel_end.record()
-                            _record_kernel_envelope_event()
-
-                elif channel_method == "think":
-                    # ThinK decode: recover full-channel K with torch, then run dense attention.
-
-                    if _profile:
-                        _evt_recovery_start = _new_evt()
-                        _evt_recovery_end = _new_evt()
-                        _evt_cat_start = _new_evt()
-                        _evt_cat_end = _new_evt()
-                        _evt_recovery_start.record()
-
-                    # Paper-faithful ThinK recovery: per-head bool mask
-                    # broadcast + boolean indexing.
-                    think_mask = past_key_value.think_mask[self.layer_idx]
-                    bsz_r, h_kv, seq_r = key_pruned.shape[:3]
-                    head_dim_r = self.head_dim
-                    recovered_key_states = torch.zeros(bsz_r, h_kv, seq_r, head_dim_r, dtype=key_pruned.dtype, device=key_pruned.device)
-                    mask_expanded = think_mask.unsqueeze(2).expand(-1, -1, seq_r, -1)
-                    recovered_key_states[mask_expanded] = key_pruned.reshape(-1)
-
-                    if _profile:
-                        _evt_recovery_end.record()
-                        _evt_cat_start.record()
-
-                    key_states = torch.cat([key_prompt, recovered_key_states, text_key_states], dim=-2)
-
-                    if _profile:
-                        _evt_cat_end.record()
-
-                    if getattr(self.config, "decode_attention_backend", "fa2") == "triton":
-                        if _custom_kernel_event_profile:
-                            _evt_custom_kernel_start = _new_evt()
-                            _evt_custom_kernel_end = _new_evt()
-                            _evt_custom_kernel_start.record()
-
-                        run_custom_decode_kernel._profile_kernel = _profile
-                        run_custom_decode_kernel._profile_layer_idx = self.layer_idx if _profile else None
-                        attn_output = run_dense_decode_kernel(
-                            query_states=query_states,
-                            key_states=key_states,
-                            value_states=value_states,
-                            num_key_value_groups=self.num_key_value_groups,
-                            attention_mask=attention_mask,
-                        )
-
-                        if _custom_kernel_event_profile:
-                            _evt_custom_kernel_end.record()
-                            _record_kernel_envelope_event()
-
-
-                elif channel_method == "spark":
-                    # SparK (compact-storage) recovery: pre-fill [B, H, S_v, D]
-                    # with per-token pruned-channel mean, then write compact K
-                    # into the True positions via boolean indexing.
-                    spark_mask = past_key_value.spark_mask[self.layer_idx]            # [B, H, S_v, D] bool
-                    pruned_mean = past_key_value.spark_pruned_mean[self.layer_idx]    # [B, H, S_v, 1]
-                    bsz_r, h_kv, seq_r, _ = key_pruned.shape
+                    # SparK: pruned channels take the token's pruned-channel mean
+                    pruned_mean = past_key_value.spark_pruned_mean[self.layer_idx]  # [B, H_kv, S_v, 1]
                     recovered_key_states = pruned_mean.expand(bsz_r, h_kv, seq_r, self.head_dim).contiguous()
-                    recovered_key_states[spark_mask] = key_pruned.reshape(-1)
-                    key_states = torch.cat([key_prompt, recovered_key_states, text_key_states], dim=-2)
-
-                    if getattr(self.config, "decode_attention_backend", "fa2") == "triton":
-                        if _custom_kernel_event_profile:
-                            _evt_custom_kernel_start = _new_evt()
-                            _evt_custom_kernel_end = _new_evt()
-                            _evt_custom_kernel_start.record()
-
-                        run_custom_decode_kernel._profile_kernel = _profile
-                        run_custom_decode_kernel._profile_layer_idx = self.layer_idx if _profile else None
-                        attn_output = run_dense_decode_kernel(
-                            query_states=query_states,
-                            key_states=key_states,
-                            value_states=value_states,
-                            num_key_value_groups=self.num_key_value_groups,
-                            attention_mask=attention_mask,
-                        )
-
-                        if _custom_kernel_event_profile:
-                            _evt_custom_kernel_end.record()
-                            _record_kernel_envelope_event()
-
-                elif channel_method == "rotatek":
-                    # Two storage modes (selected at prefill via ROTATEK_STORAGE):
-                    #   - full      : key_pruned is [S_v, D] (rank-D_keep proj
-                    #                 in original basis) → standard FA2.
-                    #   - truncated : key_pruned is [S_v, D_keep] (rotated
-                    #                 truncated form) → split-K kernel with Q
-                    #                 rotation + δμ bias on vision logits.
-                    if key_pruned.shape[-1] == self.head_dim:
-                        key_states = torch.cat([key_prompt, key_pruned, text_key_states], dim=-2)
-                    else:
-                        # Fused phase-1 Triton kernel — Q@R + δμ folded into
-                        # the softmax inner loop. Faster than calling Full's
-                        # `sparse_channel_decode_triton` with external Q@R
-                        # because the latter incurs split-0 straggler +
-                        # register-pressure overhead in the dual-D path.
-                        from rotatek import rotatek_decode_fused
-
-                        q_squeezed = query_states.squeeze(2)
-                        bsz_q, h_q, head_dim = q_squeezed.shape
-                        R_partial = past_key_value.rotatek_rotations[self.layer_idx]
-                        delta_mu = past_key_value.rotatek_means[self.layer_idx]
-
-                        s_prompt = key_prompt.shape[-2]
-                        s_vision = key_pruned.shape[-2]
-                        v_prompt = value_states[:, :, :s_prompt, :]
-                        v_vision = value_states[:, :, s_prompt:s_prompt + s_vision, :]
-                        v_text = value_states[:, :, s_prompt + s_vision:, :]
-
-                        k_full = torch.cat([key_prompt, text_key_states], dim=-2)
-                        v_full = torch.cat([v_prompt, v_text], dim=-2)
-
-                        s_full = k_full.shape[-2]
-                        mask_full = torch.ones(
-                            bsz_q, s_full,
-                            device=q_squeezed.device, dtype=torch.uint8,
-                        )
-
-                        attn_output, _, _ = rotatek_decode_fused(
-                            q_full=q_squeezed,
-                            R_partial=R_partial,
-                            delta_mu=delta_mu,
-                            k_full=k_full,
-                            v_full=v_full,
-                            mask_full=mask_full,
-                            k_sparse=key_pruned,
-                            v_sparse=v_vision,
-                            num_kv_groups=self.num_key_value_groups,
-                        )
-                        self._rotatek_truncated_attn_output = attn_output
-
-                else:
-                    raise ValueError(f"Unsupported channel_method for decode: {channel_method}")
-
+                    recovered_key_states[past_key_value.spark_mask[self.layer_idx]] = key_pruned.reshape(-1)
+                key_states = torch.cat([key_prompt, recovered_key_states, text_key_states], dim=-2)
+                if use_triton_decode:
+                    attn_output = run_dense_decode_kernel(query_states, key_states, value_states, self.num_key_value_groups)
 
         dropout_rate = 0.0 if not self.training else self.attention_dropout
 
@@ -1736,42 +1035,11 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
-
-        # FA2 attention — skip only when a custom kernel has already produced
-        # attn_output (decode-only optimisations).
-        _rotatek_trunc_handled = (
-            getattr(self, "_rotatek_truncated_attn_output", None) is not None
-        )
-        if _rotatek_trunc_handled:
-            # consume — must not leak to the next forward call
-            self._rotatek_truncated_attn_output = None
-        _custom_decode_kernel_handled = (
-            past_key_value is not None
-            and q_len == 1
-            and (
-                (
-                    getattr(self.config, "decode_attention_backend", "fa2") == "triton"
-                    and (channel_ratio == 0.0 or channel_method in ("think", "spark"))
-                )
-                or _rotatek_trunc_handled
-            )
-        )
-
-        if not _custom_decode_kernel_handled:
-            if _profile:
-                _evt_transpose_start = _new_evt()
-                _evt_transpose_end = _new_evt()
-                _evt_attn_start = _new_evt()
-                _evt_attn_end = _new_evt()
-
-                _evt_transpose_start.record()
-
+        if attn_output is None:
+            # Reashape to the expected shape for Flash Attention
             query_states = query_states.transpose(1, 2)
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
-
-            if _profile:
-                _evt_transpose_end.record()
 
             if (
                 self.config.use_sliding_window
@@ -1781,32 +1049,6 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
                 sliding_window = self.config.sliding_window
             else:
                 sliding_window = None
-
-            if _profile:
-                if not hasattr(self.config, '_fa2_shapes_logged'):
-                    _kv_bytes = key_states.nelement() * key_states.element_size() + value_states.nelement() * value_states.element_size()
-                    print(f"[FA2 shapes] Q={query_states.shape} K={key_states.shape} V={value_states.shape}"
-                          f" dtype={key_states.dtype} K.stride={key_states.stride()} K.contiguous={key_states.is_contiguous()}"
-                          f" mask={attention_mask.shape if attention_mask is not None else None}"
-                          f" KV_MB={_kv_bytes / 1024 / 1024:.1f}")
-                    self.config._fa2_shapes_logged = True
-                _evt_attn_start.record()
-
-            # if q_len == 1:
-            #     import pdb; pdb.set_trace()
-
-            # Boundary off-by-one in prompt_seqlen / query_seqlen detection
-            # (visionzip outer wrapper reads from input_ids while channel
-            # pruning paths slice the K cache) can leave the decode-time K
-            # cat reconstruction longer than the V cache on degenerate
-            # samples (e.g. video with very few visual tokens). Truncate to
-            # the shorter length so FA2's strict V shape check passes.
-            # Affects ~1 in 499 video_dc499 samples; normal samples have
-            # matching K/V lengths and this branch is a no-op.
-            if key_states.shape[1] != value_states.shape[1]:
-                _min = min(key_states.shape[1], value_states.shape[1])
-                key_states = key_states[:, :_min].contiguous()
-                value_states = value_states[:, :_min].contiguous()
 
             attn_output = _flash_attention_forward(
                 query_states,
@@ -1820,186 +1062,11 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
                 use_top_left_mask=self._flash_attn_uses_top_left_mask,
             )
 
-            if _profile:
-                _evt_attn_end.record()
-
-        original_attn_output = None
-
-
-        # ------------------------------------------------------------------
-        # output projection
-        # ------------------------------------------------------------------
-        if _profile:
-            _evt_attn_out_start = _new_evt()
-            _evt_attn_out_end = _new_evt()
-            _evt_attn_out_start.record()
-
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
 
-        if _profile:
-            _evt_attn_out_end.record()
-
-
-        # ------------------------------------------------------------------
-        # accumulate timings
-        # ------------------------------------------------------------------
-        if _profile:
-            torch.cuda.synchronize()
-
-            _all_timings = getattr(self.config, '_decode_timings_by_layer', None)
-            if _all_timings is None:
-                _all_timings = {}
-                self.config._decode_timings_by_layer = _all_timings
-
-            _timings = _all_timings.get(self.layer_idx)
-            if _timings is None:
-                _timings = {
-                    'qkv_proj_rope_ms': [],
-                    'qkv_proj_ms': [],
-                    'rope_ms': [],
-                    'cache_update_ms': [],
-                    'cat_ms': [],
-                    'recovery_ms': [],
-                    'custom_decode_kernel_ms': [],
-                    'transpose_ms': [],
-                    'fa2_ms': [],
-                    'attn_out_proj_ms': [],
-                }
-                _all_timings[self.layer_idx] = _timings
-
-            # backward compat: keep layer 0 as _decode_timings
-            if self.layer_idx == 0:
-                self.config._decode_timings = _timings
-
-            _kernel_timings_by_layer = getattr(run_custom_decode_kernel, '_kernel_timings_by_layer', None)
-            _kernel_timings = (
-                _kernel_timings_by_layer.get(self.layer_idx)
-                if _kernel_timings_by_layer is not None
-                else None
-            )
-            if _kernel_timings is not None:
-                _pending_dense_events = _kernel_timings.get('_pending_dense_events', [])
-                if _pending_dense_events:
-                    _kernel_timings.setdefault('triton_ms', [])
-                    _kernel_timings.setdefault('q_prepare_ms', [])
-                    for _event_record in _pending_dense_events:
-                        _kernel_timings['triton_ms'].append(
-                            _event_record['triton_start'].elapsed_time(_event_record['triton_end'])
-                        )
-                    _kernel_timings['_pending_dense_events'] = []
-
-                _pending_events = _kernel_timings.get('_pending_events', [])
-                if _pending_events:
-                    for _event_record in _pending_events:
-                        _kernel_timings.setdefault('triton_ms', [])
-                        _kernel_timings.setdefault('cache_setup_ms', [])
-                        _kernel_timings.setdefault('index_setup_ms', [])
-                        _kernel_timings.setdefault('static_setup_ms', [])
-                        _kernel_timings.setdefault('view_setup_ms', [])
-                        _kernel_timings.setdefault('q_prepare_ms', [])
-                        _kernel_timings.setdefault('q_alloc_ms', [])
-                        _kernel_timings.setdefault('full_prepare_ms', [])
-                        _kernel_timings.setdefault('inner_pre_backend_ms', [])
-                        _kernel_timings.setdefault('inner_post_backend_ms', [])
-                        _kernel_timings.setdefault('head_dim_keep', [])
-                        _kernel_timings.setdefault('pruned_dim', [])
-                        _kernel_timings.setdefault('seq_sparse', [])
-                        _kernel_timings.setdefault('seq_prompt', [])
-                        _kernel_timings.setdefault('seq_text', [])
-                        _kernel_timings.setdefault('num_splits', [])
-                        _kernel_timings.setdefault('block_k', [])
-                        _kernel_timings.setdefault('block_p', [])
-                        _kernel_timings['cache_setup_ms'].append(
-                            _event_record['cache_setup_evt'].elapsed_time(_event_record['cache_setup_done'])
-                        )
-                        _kernel_timings['index_setup_ms'].append(
-                            _event_record['index_setup_evt'].elapsed_time(_event_record['index_setup_done'])
-                        )
-                        _kernel_timings['static_setup_ms'].append(
-                            _event_record['static_setup_evt'].elapsed_time(_event_record['static_setup_done'])
-                        )
-                        _kernel_timings['view_setup_ms'].append(
-                            _event_record['view_setup_evt'].elapsed_time(_event_record['view_setup_done'])
-                        )
-                        _kernel_timings['q_alloc_ms'].append(0.0)
-                        _kernel_timings['q_prepare_ms'].append(0.0)
-                        _kernel_timings['full_prepare_ms'].append(0.0)
-                        _kernel_timings['inner_pre_backend_ms'].append(
-                            _event_record['cache_setup_evt'].elapsed_time(_event_record['pre_backend_evt'])
-                        )
-                        _kernel_timings['triton_ms'].append(
-                            _event_record['backend_evt'].elapsed_time(_event_record['backend_done'])
-                        )
-                        _kernel_timings['inner_post_backend_ms'].append(
-                            _event_record['backend_done'].elapsed_time(_event_record['post_backend_evt'])
-                        )
-                        for _meta_key in (
-                            'head_dim_keep', 'pruned_dim', 'seq_sparse', 'seq_prompt',
-                            'seq_text', 'num_splits', 'block_k', 'block_p',
-                        ):
-                            _kernel_timings[_meta_key].append(_event_record[_meta_key])
-                    _kernel_timings['_pending_events'] = []
-
-            _timings["qkv_proj_rope_ms"].append(_elapsed_ms(_evt_qkv_proj_rope_start, _evt_qkv_proj_rope_end))
-            _timings["qkv_proj_ms"].append(_elapsed_ms(_evt_qkv_proj_start, _evt_qkv_proj_end))
-            _timings["rope_ms"].append(_elapsed_ms(_evt_rope_start, _evt_rope_end))
-            _timings["cache_update_ms"].append(_elapsed_ms(_evt_cache_update_start, _evt_cache_update_end))
-            _timings["recovery_ms"].append(_elapsed_ms(_evt_recovery_start, _evt_recovery_end))
-            _timings["cat_ms"].append(_elapsed_ms(_evt_cat_start, _evt_cat_end))
-            _timings["custom_decode_kernel_ms"].append(_elapsed_ms(_evt_custom_kernel_start, _evt_custom_kernel_end))
-            if _evt_custom_kernel_start is not None and _evt_custom_kernel_end is not None:
-                _backend_events_by_layer = getattr(run_custom_decode_kernel, '_backend_events_by_layer', None)
-                _backend_events = (
-                    _backend_events_by_layer.get(self.layer_idx)
-                    if _backend_events_by_layer is not None
-                    else None
-                )
-                if _backend_events is not None:
-                    _backend_evt, _backend_done = _backend_events
-                    if _backend_evt is not None and _backend_done is not None:
-                        _kernel_timings_by_layer = getattr(run_custom_decode_kernel, '_kernel_timings_by_layer', None)
-                        _kernel_timings = (
-                            _kernel_timings_by_layer.get(self.layer_idx)
-                            if _kernel_timings_by_layer is not None
-                            else None
-                        )
-                        if _kernel_timings is not None:
-                            _kernel_timings.setdefault('pre_backend_ms', [])
-                            _kernel_timings.setdefault('post_backend_ms', [])
-                            _kernel_timings['pre_backend_ms'].append(
-                                _evt_custom_kernel_start.elapsed_time(_backend_evt)
-                            )
-                            _kernel_timings['post_backend_ms'].append(
-                                _backend_done.elapsed_time(_evt_custom_kernel_end)
-                            )
-            _timings["transpose_ms"].append(_elapsed_ms(_evt_transpose_start, _evt_transpose_end))
-            _timings["fa2_ms"].append(_elapsed_ms(_evt_attn_start, _evt_attn_end))
-            _timings["attn_out_proj_ms"].append(_elapsed_ms(_evt_attn_out_start, _evt_attn_out_end))
-        if True: #not output_attentions:
-            attn_weights = None
-
-        if False: #output_attentions:
-            query_states = query_states.transpose(1,2) # (Batch, Seqlen, Head, dim) -> (Batch, Head, Seqlen, dim)
-            key_states = key_states.transpose(1,2)
-            # Expand K to H_q for manual matmul (only needed for attention weight visualization)
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-
-            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-            if attention_mask is not None:  # no matter the length, we just slice it
-                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-                attn_weights = attn_weights + causal_mask
-
-            # Fix precision issues in Qwen2-VL float16 inference
-            # Replace inf values with zeros in attention weights to prevent NaN propagation
-            if query_states.dtype == torch.float16:
-                attn_weights = torch.where(torch.isinf(attn_weights), torch.zeros_like(attn_weights), attn_weights)
-
-            # upcast attention to fp32
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-        return attn_output, attn_weights, past_key_value, original_attn_output
+        attn_weights = None
+        return attn_output, attn_weights, past_key_value
 
 
 class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
@@ -2104,7 +1171,6 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
     def __init__(self, config: Qwen2_5_VLConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.layer_idx = layer_idx
 
         if config.use_sliding_window and config._attn_implementation != "flash_attention_2":
             logger.warning_once(
@@ -2151,23 +1217,12 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
                 into the model
         """
 
-        _seq_len = hidden_states.shape[1]
-        _config = self.self_attn.config
-        _layer_profile = (
-            getattr(_config, '_decode_profile', False)
-            and self.layer_idx == 0
-        )
-
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        if _layer_profile:
-            _evt_attn_module_start = torch.cuda.Event(enable_timing=True)
-            _evt_attn_module_start.record()
-
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value, original_hidden_states = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -2177,56 +1232,15 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
-
-        if _layer_profile:
-            _evt_attn_module_end = torch.cuda.Event(enable_timing=True)
-            _evt_attn_module_end.record()
-
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-
-        if _layer_profile:
-            _evt_ffn_start = torch.cuda.Event(enable_timing=True)
-            _evt_ffn_start.record()
-
         hidden_states = self.mlp(hidden_states)
-
-        if _layer_profile:
-            _evt_ffn_end = torch.cuda.Event(enable_timing=True)
-            _evt_ffn_end.record()
-            torch.cuda.synchronize()
-            _phase = 'prefill' if _seq_len > 1 else 'decode'
-            _timings = getattr(_config, '_layer_timings', None)
-            if _timings is None:
-                _timings = {
-                    'prefill_attn_ms': [], 'prefill_ffn_ms': [],
-                    'decode_attn_ms': [], 'decode_ffn_ms': [],
-                }
-                _config._layer_timings = _timings
-            _timings[f'{_phase}_attn_ms'].append(_evt_attn_module_start.elapsed_time(_evt_attn_module_end))
-            _timings[f'{_phase}_ffn_ms'].append(_evt_ffn_start.elapsed_time(_evt_ffn_end))
-
         hidden_states = residual + hidden_states
-        # if original_hidden_states != None:
-        #     original_residual = original_hidden_states
-        #     original_hidden_states = self.post_attention_layernorm(original_hidden_states)
-        #     original_hidden_states = self.mlp(original_hidden_states)
-        #     original_hidden_states = original_residual + original_hidden_states
 
         outputs = (hidden_states,)
-        # print("hidden_states: ", hidden_states.shape)
-
-        # if original_hidden_states != None:
-        #     if hidden_states.shape[1] == 1:
-        #         input("here")
-
-        # print(self.layer_idx, "layer: ", attn_error.float().cpu().numpy().tolist())
-
-        # if self.layer_idx == 27:
-        #     input("here")
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -2244,46 +1258,6 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
 class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
     def __init__(self, config: Qwen2_5_VLConfig):
         super().__init__(config)
-        if not hasattr(self.config, "channel_method"):
-            # VisionK was retired (moved to legacy/methods/visionk_method.py).
-            self.config.channel_method = "think"
-        if not hasattr(self.config, "layer_adaptive_channel_budget"):
-            self.config.layer_adaptive_channel_budget = False
-        if not hasattr(self.config, "channel_reconstruction"):
-            self.config.channel_reconstruction = "off"
-        self.config.channel_reconstruction = str(self.config.channel_reconstruction).strip().lower()
-        if self.config.channel_reconstruction == "true":
-            self.config.channel_reconstruction = "matrix"
-        elif self.config.channel_reconstruction == "false":
-            self.config.channel_reconstruction = "off"
-        _valid_reconstruction = {"off", "constant", "mean", "matrix"}
-        if self.config.channel_reconstruction not in _valid_reconstruction:
-            raise ValueError(
-                f"Unsupported channel_reconstruction={self.config.channel_reconstruction}. "
-                f"Use one of: {', '.join(sorted(_valid_reconstruction))}"
-            )
-        if not hasattr(self.config, "reconstruction_constant"):
-            self.config.reconstruction_constant = 0.1
-        if not hasattr(self.config, "custom_kernel"):
-            self.config.custom_kernel = True
-        if not hasattr(self.config, "decode_attention_backend"):
-            self.config.decode_attention_backend = "fa2"
-        if not hasattr(self.config, "calibration_mode"):
-            self.config.calibration_mode = "off"
-        if not hasattr(self.config, "offline_calibration_tasks"):
-            self.config.offline_calibration_tasks = "channel_importance"
-
-        # VisionK-specific knobs no longer consumed; force safe defaults.
-        self.config.layer_adaptive_channel_budget = False
-        self.config.channel_reconstruction = "off"
-        self.config.custom_kernel = False
-        # RotateK has its own calibration path; other methods force off.
-        if self.config.channel_method != "rotatek":
-            self.config.calibration_mode = "off"
-
-        # custom kernel only supports "off" and "matrix" reconstruction
-        if self.config.channel_reconstruction not in ("off", "matrix"):
-            self.config.custom_kernel = False
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -2298,20 +1272,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
-
-        self.channel_ratio_high = None
-        self.channel_ratio_low = None
-        self._layer_budget_by_sparsity = {}
-        if self.config.layer_adaptive_channel_budget:
-            budget_sparsity = round(float(self.config.channel_ratio), 3)
-            calibration_dominant_ratio = _require_calibration_dominant_ratio(self.config)
-            budget_path = (
-                f"./results/Qwen2.5_VL_7B/"
-                f"mmstar_calibration_dominant_ratio_{calibration_dominant_ratio:.2f}/attention_shift/"
-                f"layer_budget_sparsity_{budget_sparsity:.3f}.csv"
-            )
-            with open(budget_path, "r", newline="") as f:
-                self._layer_budget_by_sparsity[budget_sparsity] = [float(line.strip()) for line in f if line.strip()]
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -2332,10 +1292,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-
-        if inputs_embeds.shape[1] == 1:
-            output_attentions = True
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -2343,24 +1299,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        _model_seq_len = (
-            inputs_embeds.shape[1]
-            if inputs_embeds is not None
-            else (input_ids.shape[1] if input_ids is not None else 0)
-        )
-        _profile_model_forward = getattr(self.config, "_decode_profile", False) and _model_seq_len == 1
-        if _profile_model_forward:
-            _evt_model_forward_start = torch.cuda.Event(enable_timing=True)
-            _evt_model_setup_end = torch.cuda.Event(enable_timing=True)
-            _evt_model_mask_end = torch.cuda.Event(enable_timing=True)
-            _evt_model_rope_end = torch.cuda.Event(enable_timing=True)
-            _evt_model_layers_end = torch.cuda.Event(enable_timing=True)
-            _evt_model_norm_end = torch.cuda.Event(enable_timing=True)
-            _evt_model_forward_start.record()
-        else:
-            _evt_model_forward_start = _evt_model_setup_end = _evt_model_mask_end = None
-            _evt_model_rope_end = _evt_model_layers_end = _evt_model_norm_end = None
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -2391,50 +1329,21 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         elif position_ids.dim() == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
-        if _profile_model_forward:
-            _evt_model_setup_end.record()
-
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
-
-        if _profile_model_forward:
-            _evt_model_mask_end.record()
 
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        if _profile_model_forward:
-            _evt_model_rope_end.record()
-
-        
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        if self.channel_ratio_high == None and self.channel_ratio_low == None:
-            self.channel_ratio_high = self.config.channel_ratio
-            self.channel_ratio_low = 0
-
-        for layer_idx, decoder_layer in enumerate(self.layers):
-            """
-            layer-wise adaptive channel budget
-            """
-            if self.config.layer_adaptive_channel_budget:
-                budget_sparsity = round(float(self.channel_ratio_high), 3)
-                layer_budget = self._layer_budget_by_sparsity.get(budget_sparsity)
-                if layer_budget is not None:
-                    self.config.channel_ratio = layer_budget[layer_idx]
-                else:
-                    self.config.channel_ratio = self.channel_ratio_high
-            else:
-                self.config.channel_ratio = self.channel_ratio_high
-
-            # print("layer-adaptive, layer_idx, channel_ratio:", self.config.layer_adaptive_channel_budget, layer_idx, self.config.channel_ratio)
-
+        for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2470,41 +1379,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-        if _profile_model_forward:
-            _evt_model_layers_end.record()
-
         hidden_states = self.norm(hidden_states)
-
-        if _profile_model_forward:
-            _evt_model_norm_end.record()
-            torch.cuda.synchronize()
-            _model_timings = getattr(self.config, '_model_forward_timings', None)
-            if _model_timings is None:
-                _model_timings = {
-                    'setup_cuda_ms': [],
-                    'mask_cuda_ms': [],
-                    'rotary_cuda_ms': [],
-                    'decoder_layers_cuda_ms': [],
-                    'final_norm_cuda_ms': [],
-                    'model_total_cuda_ms': [],
-                }
-                self.config._model_forward_timings = _model_timings
-            _model_timings['setup_cuda_ms'].append(_evt_model_forward_start.elapsed_time(_evt_model_setup_end))
-            _model_timings['mask_cuda_ms'].append(_evt_model_setup_end.elapsed_time(_evt_model_mask_end))
-            _model_timings['rotary_cuda_ms'].append(_evt_model_mask_end.elapsed_time(_evt_model_rope_end))
-            _model_timings['decoder_layers_cuda_ms'].append(_evt_model_rope_end.elapsed_time(_evt_model_layers_end))
-            _model_timings['final_norm_cuda_ms'].append(_evt_model_layers_end.elapsed_time(_evt_model_norm_end))
-            _model_timings['model_total_cuda_ms'].append(_evt_model_forward_start.elapsed_time(_evt_model_norm_end))
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-
         next_cache = next_decoder_cache if use_cache else None
-
-        # if hidden_states.shape[-2] == 1: # decoding                
-        #     input("here")
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
@@ -2796,115 +1677,13 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.rope_deltas = None  # cache rope_deltas here
 
+        # RotateK: VisionZip keep ratios (dominant = top-attended tokens,
+        # contextual = merged representatives of the rest)
         self.dominant_ratio = config.dominant_ratio
         self.contextual_ratio = config.contextual_ratio
-        self.channel_ratio = config.channel_ratio
-        self.channel_start = config.channel_start
-        self.channel_end = config.channel_end
-
-        self.calibration_mode = str(getattr(self.config, "calibration_mode", "off")).strip().lower()
-        calibration_task_spec = getattr(self.config, "offline_calibration_tasks", "channel_importance")
-        valid_calibration_tasks = {"channel_importance", "modality_score", "supplementary_matrix", "attention_shift", "attention_kl", "rotation_matrix", "all"}
-        calibration_tasks = {
-            item.strip().lower()
-            for item in str(calibration_task_spec).split(",")
-            if item.strip() and item.strip().lower() in valid_calibration_tasks
-        }
-        calibration_tasks_requiring_importance = {"supplementary_matrix", "attention_shift", "attention_kl", "all"}
-        should_load_calibration_importance = self.calibration_mode == "use" or (
-            self.calibration_mode == "collect" and any(task in calibration_tasks_requiring_importance for task in calibration_tasks)
-        )
-        if should_load_calibration_importance:
-            calibration_dominant_ratio = _require_calibration_dominant_ratio(self.config)
-            calibration_importance_dir = (
-                f"./results/Qwen2.5_VL_7B/"
-                f"mmstar_calibration_dominant_ratio_{calibration_dominant_ratio:.2f}/channel_importance"
-            )
-            self.calibration_channel_importance = load_channel_importance_calibration(
-                calibration_importance_dir,
-                num_layers=len(self.model.layers),
-            )
-            if not self.calibration_channel_importance:
-                raise FileNotFoundError(
-                    f"No channel-importance calibration files were loaded from: {calibration_importance_dir}"
-                )
-            missing_layers = [i for i in range(len(self.model.layers)) if i not in self.calibration_channel_importance]
-            if missing_layers:
-                raise ValueError(
-                    f"Missing channel-importance calibration for layers: {missing_layers}"
-                )
-        else:
-            self.calibration_channel_importance = None
-
-        for layer_idx, layer in enumerate(self.model.layers):
-            layer_importance = None if self.calibration_channel_importance is None else self.calibration_channel_importance[layer_idx]
-            layer.calibration_channel_importance = layer_importance
-            layer.self_attn.calibration_channel_importance = layer_importance
-
-        # RotateK offline calibration: load per-layer R if calibration_mode="use"
-        # and channel_method=="rotatek". Mirrors InternVL adapter logic.
-        rotation_calibration = self._load_calibration_rotation_matrix(
-            self.config, num_layers=len(self.model.layers),
-        )
-        for layer_idx, layer in enumerate(self.model.layers):
-            R_partial = (
-                None if rotation_calibration is None else rotation_calibration[layer_idx]
-            )
-            layer.self_attn.calibration_rotation_R_partial = R_partial
 
         # Initialize weights and apply final processing
         self.post_init()
-
-    @staticmethod
-    def _load_calibration_rotation_matrix(config, num_layers):
-        """Load per-layer R_partial when calibration_mode=='use' AND
-        channel_method=='rotatek'. Returns dict {layer_idx: R_partial} or None.
-        """
-        calibration_mode = str(getattr(config, "calibration_mode", "off")).strip().lower()
-        channel_method = str(getattr(config, "channel_method", "")).strip().lower()
-        if calibration_mode != "use" or channel_method != "rotatek":
-            return None
-
-        # Pull head_dim and channel_ratio from llm config
-        channel_ratio = float(getattr(config, "channel_ratio", 0.0))
-        # For Qwen2.5-VL: hidden_size / num_attention_heads
-        head_dim = int(getattr(config, "hidden_size", 0)) // int(
-            getattr(config, "num_attention_heads", 1)
-        )
-        if head_dim <= 0:
-            raise RuntimeError(
-                "Cannot infer head_dim from config for RotateK calibration load"
-            )
-        prune_count = min(head_dim, max(0, int(head_dim * channel_ratio)))
-        keep_count = head_dim - prune_count
-        if keep_count <= 0:
-            return None
-
-        calibration_dominant_ratio = _require_calibration_dominant_ratio(config)
-        # Default Qwen calibration root used elsewhere in this file.
-        result_root = "./results/Qwen2.5_VL_7B"
-        calibration_dir = os.path.join(
-            result_root,
-            f"mmstar_calibration_dominant_ratio_{calibration_dominant_ratio:.2f}",
-            "rotation_matrix",
-        )
-        # Reuse the InternVL loader (data format is identical).
-        from lmms_eval.models.model_utils.internvl.internvl2_5_visionzip import (
-            load_rotation_matrix_calibration,
-        )
-        loaded = load_rotation_matrix_calibration(
-            calibration_dir, num_layers=num_layers, keep_count=keep_count,
-        )
-        if not loaded:
-            raise FileNotFoundError(
-                f"No rotation-matrix calibration files were loaded from: {calibration_dir}"
-            )
-        missing = [i for i in range(num_layers) if i not in loaded]
-        if missing:
-            raise ValueError(
-                f"Missing rotation-matrix calibration for layers: {missing}"
-            )
-        return loaded
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -3163,24 +1942,6 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         "The image shows a street scene with a red stop sign in the foreground. In the background, there is a large red gate with Chinese characters ..."
         ```"""
 
-        _decode_seq_len = (
-            inputs_embeds.shape[1]
-            if inputs_embeds is not None
-            else (input_ids.shape[1] if input_ids is not None else 0)
-        )
-        _profile_enabled = getattr(self.config, "_decode_profile", False)
-        _profile_forward = _profile_enabled
-        _forward_phase = "decode" if _decode_seq_len == 1 else "prefill"
-        if _profile_forward:
-            _wall_forward_start = perf_counter()
-            _evt_forward_start = torch.cuda.Event(enable_timing=True)
-            _evt_pre_model_end = torch.cuda.Event(enable_timing=True)
-            _evt_model_end = torch.cuda.Event(enable_timing=True)
-            _evt_lm_head_end = torch.cuda.Event(enable_timing=True)
-            _evt_forward_start.record()
-        else:
-            _evt_forward_start = _evt_pre_model_end = _evt_model_end = _evt_lm_head_end = None
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -3214,13 +1975,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 select_pixel = True
                 visual_token_id = self.config.video_token_id
                 pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-                video_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-                if isinstance(video_outputs, tuple):
-                    video_embeds, attn_logits, attn_key = video_outputs
-                else:
-                    video_embeds = video_outputs
-                    attn_logits = None
-                    attn_key = None
+                video_embeds, attn_logits, attn_key = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
                 n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
                 n_video_features = video_embeds.shape[0]
                 if n_video_tokens != n_video_features:
@@ -3238,8 +1993,6 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
-
-        # print("input_ids, attention_mask: ", input_ids.shape if input_ids is not None else None, attention_mask.shape if attention_mask is not None else None)
 
         # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
         if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
@@ -3273,7 +2026,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
 
-        # Update prompt/query boundaries from image-token span even when token pruning is disabled.
+        # RotateK: record the visual span (prompt before it, query after it) for
+        # channel pruning; updated below if VisionZip shortens the span.
         if input_ids is not None:
             visual_token_mask = (
                 (input_ids == self.config.image_token_id)
@@ -3286,23 +2040,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 self.config.prompt_seqlen = first_visual_idx
                 self.config.query_seqlen = input_ids.shape[-1] - last_visual_idx
 
-                # import pdb; pdb.set_trace()
-                
+        # VisionZip: keep the dominant (most-attended) visual tokens and merge the
+        # rest into contextual tokens, then drop the pruned positions.
         img_mask = slice(None)
         if select_pixel and attn_logits is not None:
-            if not getattr(self, "_dbg_printed", False):
-                _dn = int(self.dominant_ratio * attn_logits.size(0))
-                print(
-                    f"[DBG] dominant_ratio={self.dominant_ratio} "
-                    f"contextual_ratio={self.contextual_ratio} "
-                    f"attn_logits.size(0)={attn_logits.size(0)} "
-                    f"dominant_num={_dn} "
-                    f"inputs_embeds.shape(before)={tuple(inputs_embeds.shape)} "
-                    f"attn_mask.shape={tuple(attention_mask.shape) if attention_mask is not None else None}",
-                    flush=True,
-                )
-                self._dbg_printed = True
-
             dominant_num = int(self.dominant_ratio * attn_logits.size(0))
             contextual_num = max(int(self.contextual_ratio * attn_logits.size(0)),1)
             if attn_logits.size(0) == 0 or dominant_num <= 0 or dominant_num >= attn_logits.size(0):
@@ -3357,14 +2098,6 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 attention_mask = attention_mask[:, img_mask]
                 inputs_embeds[:, contexual_input_idx] = contextual_tokens
                 inputs_embeds = inputs_embeds[:, img_mask]
-                if getattr(self, "_dbg_printed_after", 0) < 2:
-                    print(
-                        f"[DBG] AFTER prune: inputs_embeds.shape={tuple(inputs_embeds.shape)} "
-                        f"attn_mask.shape={tuple(attention_mask.shape) if attention_mask is not None else None} "
-                        f"position_ids.shape={tuple(position_ids.shape)}",
-                        flush=True,
-                    )
-                    self._dbg_printed_after = getattr(self, "_dbg_printed_after", 0) + 1
 
                 ### token length of text queries
                 self.config.query_seqlen = input_ids.shape[-1] - last
@@ -3373,15 +2106,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
                 del contextual_tokens, hidden_states_filtered, hidden_to_merge, aggregated_hidden
 
-        # Not original implementation
+        # RotateK: swap HF's empty cache for the span-splitting one
         if len(past_key_values) == 0:
-            # replace this DynamicCache with the custom one.
             past_key_values = DynamicCache()
 
-
         torch.cuda.empty_cache()
-        if _profile_forward:
-            _evt_pre_model_end.record()
 
         outputs = self.model(
             input_ids=None,
@@ -3396,33 +2125,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             cache_position=cache_position,
         )
 
-        if _profile_forward:
-            _evt_model_end.record()
-
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-
-        if _profile_forward:
-            _evt_lm_head_end.record()
-            torch.cuda.synchronize()
-            _forward_timings = getattr(self.config, '_forward_timings', None)
-            if _forward_timings is None:
-                _forward_timings = {}
-                self.config._forward_timings = _forward_timings
-            _prefix = f'{_forward_phase}_'
-            for _key in (
-                'pre_model_cuda_ms',
-                'model_cuda_ms',
-                'lm_head_cuda_ms',
-                'forward_cuda_ms',
-                'forward_wall_ms',
-            ):
-                _forward_timings.setdefault(_prefix + _key, [])
-            _forward_timings[_prefix + 'pre_model_cuda_ms'].append(_evt_forward_start.elapsed_time(_evt_pre_model_end))
-            _forward_timings[_prefix + 'model_cuda_ms'].append(_evt_pre_model_end.elapsed_time(_evt_model_end))
-            _forward_timings[_prefix + 'lm_head_cuda_ms'].append(_evt_model_end.elapsed_time(_evt_lm_head_end))
-            _forward_timings[_prefix + 'forward_cuda_ms'].append(_evt_forward_start.elapsed_time(_evt_lm_head_end))
-            _forward_timings[_prefix + 'forward_wall_ms'].append((perf_counter() - _wall_forward_start) * 1000.0)
 
         loss = None
         if labels is not None:

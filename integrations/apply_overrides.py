@@ -7,7 +7,10 @@ lmms-eval resolves ``--model <name>`` through a registry in
 registered there. And once copied into site-packages those wrappers still need to
 ``import rotatek``, which only resolves if the repo root is on ``sys.path``.
 
-This script does all three, and is idempotent.
+This script does all three, and is idempotent. One stock file is replaced
+rather than added: ``tasks/_task_utils/file_utils.py`` gains a guard so that
+TextVQA's submission-file hook works when ``simple_evaluate`` is called from
+Python (no CLI ``args``); stock 0.5.0 crashes there after generation.
 
 Usage:
     python integrations/apply_overrides.py            # install
@@ -29,7 +32,6 @@ MODELS = {
     "llava_next_fastv": "LlavaNext_FastV",
     "qwen2_5_vl_visionzip": "Qwen2_5_VL_VisionZip",
     "qwen2_5_vl_fastv": "Qwen2_5_VL_FastV",
-    "internvl2_5_visionzip": "InternVL2_5_VisionZip",
 }
 MARK_BEGIN = "    # --- RotateK integration (added by integrations/apply_overrides.py) ---"
 MARK_END = "    # --- end RotateK integration ---"
@@ -57,10 +59,17 @@ def copy_tree(src: Path, dst: Path) -> list[str]:
 
 def register(init_py: Path, apply: bool) -> str:
     text = init_py.read_text()
-    if MARK_BEGIN in text:
-        return "already registered"
     entries = "\n".join(f'    "{k}": "{v}",' for k, v in MODELS.items())
     block = f"{MARK_BEGIN}\n{entries}\n{MARK_END}\n"
+    if MARK_BEGIN in text:
+        # replace a block written by an earlier version of this script
+        start = text.index(MARK_BEGIN)
+        end = text.index(MARK_END, start) + len(MARK_END) + 1
+        if text[start:end] == block:
+            return "already registered"
+        if apply:
+            init_py.write_text(text[:start] + block + text[end:])
+        return "updated registration (%d models)" % len(MODELS)
     # insert just before the closing brace of AVAILABLE_SIMPLE_MODELS
     m = re.search(r"AVAILABLE_SIMPLE_MODELS\s*=\s*\{.*?^\}", text, re.S | re.M)
     if not m:

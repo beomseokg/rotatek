@@ -60,14 +60,14 @@ and touches neither a checkpoint nor a dataset.
 
 ### Tier 2 — model latency
 
-The latency drivers load a real backbone (still on synthetic token spans, with
-the vision tower bypassed), so they additionally need FlashAttention and the
-lmms-eval integration:
+The latency drivers load a real backbone (on synthetic token spans, with the
+vision tower bypassed), so they additionally need lmms-eval, FlashAttention and
+the lmms-eval integration:
 
 ```bash
-# lmms-eval pulls its own torch; install it BEFORE pinning torch, or re-pin after
-pip install lmms-eval==0.5.0
-pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+# lmms-eval would otherwise upgrade torch; the constraint keeps 2.6.0
+printf 'torch==2.6.0\ntorchvision==0.21.0\n' > constraints.txt
+pip install lmms-eval==0.5.0 -c constraints.txt --extra-index-url https://download.pytorch.org/whl/cu124
 
 pip install flash-attn==2.7.4.post1 --no-build-isolation
 
@@ -85,7 +85,9 @@ python integrations/apply_overrides.py --check  # verify
 integration files, registers the wrappers in lmms-eval's model registry (otherwise
 `--model qwen2_5_vl_visionzip` reports "not found"), and drops a `.pth` so the
 copied wrappers can `import rotatek` from site-packages. It is idempotent and
-backs up the file it edits.
+backs up the file it edits. It also replaces one stock file,
+`tasks/_task_utils/file_utils.py`, whose TextVQA submission hook crashes when
+`simple_evaluate` is called from Python.
 
 ### Tier 3 — accuracy
 
@@ -95,23 +97,22 @@ DocVQA, VizWiz) are scored by rule-based metrics — exact match, ANLS, relaxed
 accuracy — so no API key is involved.
 
 Only the open-ended benchmarks need one: `llava_in_the_wild` and `mmvet` are
-scored by a GPT judge (`gpt-4o-mini` by default), so running those requires
-`OPENAI_API_KEY` and costs roughly \$0.0002 per sample. `vibe_eval` uses Reka
-Core instead and needs `reka-api` plus `REKA_API_KEY`.
+scored by a GPT judge (`gpt-4o-mini`), so running those requires
+`OPENAI_API_KEY` and costs roughly \$0.0002 per sample.
 
 ---
 
 ## Quickstart
 
-Reproduce one accuracy row — Qwen2.5-VL-7B with VisionZip token pruning plus
-RotateK channel pruning:
+Qwen2.5-VL-7B with VisionZip token pruning plus RotateK channel pruning:
 
 ```bash
-python scripts/paper/accuracy/visionzip_qwen.py
+python scripts/paper/accuracy/evaluate.py --model qwen --pruner visionzip \
+    --method rotatek --token_ratio 0.40 --channel_ratio 0.75 --tasks textvqa_val
 ```
 
-Or measure decode latency without touching lmms-eval or any dataset (synthetic
-inputs, vision tower bypassed):
+Or measure decode latency without any dataset (synthetic inputs, vision tower
+bypassed):
 
 ```bash
 python scripts/paper/latency/model_end_to_end_llava_next.py \
@@ -130,48 +131,60 @@ channels — the setting used throughout the paper.
 **Kernels** (tier 1 — no checkpoint, no dataset):
 
 ```bash
-# fused sparse-channel decode vs the full-channel baseline
+# fused RotateK decode vs the full-channel baseline
 python scripts/paper/kernel/kernel_profile.py --kernel both --seqlen 16000 --batch_size 32
 
 # the same comparison under CUDA-graph capture, which removes launch cost
 python scripts/paper/kernel/graph_bench.py
-
-# basis-construction solvers (Cholesky-QR / eigh / randomized)
-python scripts/paper/kernel/kernel_breakdown.py
 ```
 
-**Model latency** (tier 2):
+**Model latency** (tier 2, LLaVA-NeXT-8B as in the paper):
 
 ```bash
 ./scripts/paper/latency/run_llava_next_seqlen_sweep.sh   # prefill 16k-128k, batch 1
 ./scripts/paper/latency/run_llava_next_batch_sweep.sh    # prefill 16k, batch sweep
 python scripts/paper/latency/max_batch_sweep_llava_next.py sweep \
-    --prefill_length 64k --methods full,think,spark,rotatek --decode_tokens 64
+    --prefill_length 64k --methods full,think,spark,rotatek --output sweep_64k.json
+python scripts/paper/latency/plot_max_batch_sweep.py sweep_64k.json --output sweep_64k.png
 ```
 
-**Accuracy** (tier 3):
+Add `--profile_breakdown` to `model_end_to_end_llava_next.py` for the per-stage
+decode breakdown. The sweeps set `THINK_COMPILE` / `SPARK_COMPILE` /
+`ROTATEK_COMPILE` so every method runs compiled.
 
-| | |
-| --- | --- |
-| Qwen2.5-VL $+$ VisionZip | `python scripts/paper/accuracy/visionzip_qwen.py` |
-| Qwen2.5-VL $+$ FastV | `python scripts/paper/accuracy/fastv_qwen.py` |
-| LLaVA-NeXT $+$ VisionZip | `python scripts/paper/accuracy/visionzip_llava_next.py` |
-| LLaVA-NeXT $+$ FastV | `python scripts/paper/accuracy/fastv_llava_next.py` |
-| Lite ablation, all arms | `python scripts/paper/accuracy/lite_sweep.py` |
-
-`lite_sweep.py` runs TextVQA / InfoVQA / ChartQA (lmms-eval lite) across
-token-only, ThinK, SparK and RotateK at matched KV budgets and shards the 24
-cells over the visible GPUs; the write-up is in
-[`docs/lite_ablation.pdf`](docs/lite_ablation.pdf). The other wrappers take their
-dataset list and channel method from the `__main__` block at the bottom.
-
-The appendix ablation (Cholesky vs. `eigh`, query-aware vs. query-agnostic) comes
-from the same wrappers with different environment variables:
+**Accuracy** (tier 3). One script covers both backbones and both token pruners:
 
 ```bash
-python scripts/paper/accuracy/fastv_qwen.py                          # Cholesky + Q-aware (default)
-ROTATEK_SOLVER=eigh python scripts/paper/accuracy/fastv_qwen.py      # full eigendecomposition
-ROTATEK_QUERY_AWARE=0 python scripts/paper/accuracy/fastv_qwen.py    # K-only PCA
+TASKS=textvqa_val,infovqa_val,chartqa,docvqa_val,vizwiz_vqa_val
+
+# token pruning + Key channel pruning (method: think | spark | rotatek)
+python scripts/paper/accuracy/evaluate.py --model llava --pruner fastv \
+    --method rotatek --token_ratio 0.30 --channel_ratio 0.75 --tasks $TASKS
+
+# token pruning only, at a matched KV budget
+python scripts/paper/accuracy/evaluate.py --model llava --pruner fastv \
+    --token_ratio 0.19 --channel_ratio 0 --tasks $TASKS
+
+# unpruned baseline
+python scripts/paper/accuracy/evaluate.py --model llava --pruner visionzip \
+    --token_ratio 1.0 --channel_ratio 0 --tasks $TASKS
+```
+
+`--model` is `qwen` (Qwen2.5-VL-7B-Instruct) or `llava` (llama3-llava-next-8b);
+`--pruner` is `visionzip` (`--token_ratio` = dominant ratio, contextual fixed at
+0.05) or `fastv` (`--token_ratio` = keep ratio at layer K=2). Results go to
+`results/accuracy/`; `--limit N` evaluates only the first N samples.
+
+`scripts/paper/accuracy/lite_sweep.py` runs the lite ablation (TextVQA / InfoVQA
+/ ChartQA lite × token-only, ThinK, SparK and RotateK at matched KV budgets) over
+the visible GPUs; the write-up is in [`docs/lite_ablation.pdf`](docs/lite_ablation.pdf).
+
+The appendix ablation (Cholesky vs. `eigh`, query-aware vs. query-agnostic) uses
+the same script with environment variables:
+
+```bash
+ROTATEK_SOLVER=eigh      python scripts/paper/accuracy/evaluate.py ...   # full eigendecomposition
+ROTATEK_QUERY_AWARE=0    python scripts/paper/accuracy/evaluate.py ...   # K-only PCA
 ```
 
 ---
@@ -179,53 +192,46 @@ ROTATEK_QUERY_AWARE=0 python scripts/paper/accuracy/fastv_qwen.py    # K-only PC
 ## Repository layout
 
 ```
-rotatek/                 core method — no model-specific code
-  rotation.py            online PCA: covariance → subspace iteration → R_k, δμ
-  decode.py              decode entry points
-  kernels/               Triton kernels (fused sparse-channel + full-channel decode)
-  baselines/             ThinK and SparK, for comparison
-integrations/lmms_eval/  drop-in overrides for an installed lmms-eval
-scripts/paper/kernel/    kernel microbenchmarks   (torch + triton only)
-scripts/paper/latency/   model latency drivers    (+ backbone, lmms-eval)
-scripts/paper/accuracy/  accuracy drivers         (+ datasets)
-assets/                  figures
+rotatek/                   core method — no model-specific code
+  rotation.py              top-k eigenbasis by Cholesky-QR subspace iteration
+  kernels/fused_decode.py  decode over rotated-truncated visual Keys (2 Triton kernels)
+  kernels/full_channel_flash_decoding.py   full-width decode (baselines)
+  baselines/               ThinK and SparK channel selection
+integrations/lmms_eval/    installed into lmms-eval by apply_overrides.py
+  models/simple/           lmms-eval wrappers (Qwen2.5-VL / LLaVA-NeXT × VisionZip / FastV)
+  models/model_utils/      patched model code; kv_pruning_utils.py holds the
+                           per-layer ThinK / SparK / RotateK prefill step
+scripts/paper/kernel/      kernel microbenchmarks   (torch + triton only)
+scripts/paper/latency/     model latency drivers    (+ backbone, lmms-eval)
+scripts/paper/accuracy/    accuracy drivers         (+ datasets)
 ```
 
-`rotatek/rotation.py` and `rotatek/kernels/` have no dependency on any model or
-cache class, so they can be reused outside this repo.
+`qwen2_5vl_visionzip.py` is transformers 4.49.0's `modeling_qwen2_5_vl.py` with
+the RotateK / VisionZip changes listed at its top, so it can be diffed against
+upstream. `rotatek/` has no dependency on any model or cache class.
 
 ---
 
 ## Configuration
 
-Behaviour is controlled by environment variables:
-
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `ROTATEK_SOLVER` | `power_iter` | `power_iter` (Cholesky-QR subspace iteration) or `eigh` (exact, the solver ablation) |
 | `ROTATEK_QUERY_AWARE` | `1` | `0` ablates query-weighted PCA (K-only PCA) |
-| `ROTATEK_SOLVER` | `power_iter` | `power_iter` (Cholesky-QR subspace iteration), `randomized` (Halko–Martinsson–Tropp), anything else falls back to `torch.linalg.eigh` |
-| `ROTATEK_STORAGE` | `truncated` | `truncated` stores rotated Keys at `D_keep` and rotates Q at decode (memory **and** compute savings); `full` stores `K R Rᵀ + μ` at full width (accuracy-equivalent, no savings — useful as a drop-in for the standard FA2 path) |
-| `ROTATEK_COMPILE` | unset | `1` or `reduce-overhead` to CUDA-graph the subspace iteration |
-| `THINK_COMPILE` / `SPARK_COMPILE` | unset | Same, for the baselines |
-| `HF_HOME` | `~/.cache/huggingface` | Model cache |
-| `OPENAI_API_KEY` | — | Only for the GPT-judged open-ended tasks (`llava_in_the_wild`, `mmvet`, `dc100_en`); the five VQA benchmarks need no key |
-| `MODEL_VERSION` | `gpt-4o-mini` | Judge model for those tasks |
+| `ROTATEK_COMPILE` | unset | `1` CUDA-graphs the subspace iteration (latency runs) |
+| `THINK_COMPILE` / `SPARK_COMPILE` | unset | `default` compiles the baselines' selection (latency runs) |
+| `OPENAI_API_KEY` | — | Only for `llava_in_the_wild` / `mmvet` (GPT-judged) |
 
 ---
 
 ## Caveats
 
-1. **Triton only.** The fused decode kernel targets Triton ≥ 2.3 with
-   FlashAttention-2-style block layouts on NVIDIA GPUs. There is no CPU or ROCm
-   path.
-2. **Pinned to `transformers==4.47.0`.** The integration files fork HuggingFace
+1. **Triton only.** The decode kernels target NVIDIA GPUs through Triton; there
+   is no CPU or ROCm path.
+2. **Pinned to `transformers==4.49.0`.** The integration forks HuggingFace
    modeling code, so other versions are not expected to work.
-3. **Calibration paths.** Three integration files contain hardcoded directories
-   used for offline channel-importance dumps during development. They only matter
-   under `calibration_mode=collect`, which none of the reported results use.
-4. **GPT-judged tasks cost money.** `mmvet`, `llava_in_the_wild` and `dc100_en`
-   call the OpenAI API per sample (~$0.0002/sample with `gpt-4o-mini`).
-   `vibe_eval` uses Reka Core instead and needs `reka-api` plus `REKA_API_KEY`.
+3. **Batch size 1 for accuracy.** The VisionZip prefill for LLaVA-NeXT slices the
+   sequence per sample and assumes one sample per batch, as lmms-eval runs it.
 
 ---
 

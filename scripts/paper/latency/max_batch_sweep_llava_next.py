@@ -85,15 +85,9 @@ def _measure(method: str, batches, prefill_length: str, channel_ratio: str,
         f"attn_implementation=flash_attention_2,"
         f"channel_ratio={ratio_arg},"
         f"channel_method={method_arg},"
-        f"layer_adaptive_channel_budget=False,"
-        f"channel_reconstruction=off,"
-        f"reconstruction_constant=0.1,"
-        f"custom_kernel=False,"
-        f"decode_attention_backend=triton,"
-        f"calibration_mode=off,"
-        f"offline_calibration_tasks=channel_importance"
+        f"decode_attention_backend=triton"
     )
-    LM = models.get_model("llava_next_visionzip", force_simple=False)
+    LM = models.get_model("llava_next_visionzip")
     lm = LM.create_from_arg_string(
         model_args, {"batch_size": 1, "max_batch_size": None, "device": "cuda:0"},
     )
