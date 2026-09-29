@@ -23,6 +23,15 @@ Usage:
 """
 from __future__ import annotations
 
+import os
+import sys
+
+# Make the repo root importable so `rotatek` resolves no matter where this
+# script is launched from.
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
 import argparse
 import gc
 import json
