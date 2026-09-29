@@ -84,8 +84,7 @@ else:
 # RotateK
 from lmms_eval.models.model_utils.kv_pruning_utils import init_channel_pruner
 from lmms_eval.models.model_utils.cache_utils import Cache, DynamicCache
-from rotatek.kernels.fused_decode import rotatek_decode_fused_triton
-from rotatek.kernels.full_channel_flash_decoding import full_channel_decode_triton
+from rotatek.kernels import full_channel_decode, rotatek_decode
 
 
 logger = logging.get_logger(__name__)
@@ -95,7 +94,7 @@ def run_dense_decode_kernel(query_states, key_states, value_states, num_key_valu
     """Full-width decode attention through the Triton split-K kernel. With
     decode_attention_backend="triton" (the latency runs), Full / ThinK /
     SparK decode through this so every method is timed on Triton kernels."""
-    return full_channel_decode_triton(
+    return full_channel_decode(
         q=query_states.squeeze(-2), k=key_states, v=value_states, num_kv_groups=num_key_value_groups,
     )
 
@@ -980,7 +979,7 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
                 # and adds the δμ bias itself.
                 s_prompt, s_vision = key_prompt.shape[-2], key_pruned.shape[-2]
                 q_squeezed = query_states.squeeze(2)
-                attn_output, _, _ = rotatek_decode_fused_triton(
+                attn_output, _, _ = rotatek_decode(
                     q_full=q_squeezed,
                     R_partial=past_key_value.rotatek_rotations[self.layer_idx],
                     delta_mu=past_key_value.rotatek_means[self.layer_idx],

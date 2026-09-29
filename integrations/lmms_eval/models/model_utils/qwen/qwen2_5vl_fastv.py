@@ -32,6 +32,7 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_m
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 
 from lmms_eval.models.model_utils.cache_utils import Cache
+from rotatek.kernels import rotatek_decode
 from lmms_eval.models.model_utils.kv_pruning_utils import init_channel_pruner
 from lmms_eval.models.model_utils.qwen import qwen2_5vl_visionzip as _vz_mod
 from lmms_eval.models.model_utils.qwen.qwen2_5vl_visionzip import (
@@ -44,7 +45,6 @@ from lmms_eval.models.model_utils.qwen.qwen2_5vl_visionzip import (
     apply_multimodal_rotary_pos_emb,
     repeat_kv,
 )
-from rotatek.kernels.fused_decode import rotatek_decode_fused_triton
 
 
 class Qwen2_5_VLFastVAttention(Qwen2_5_VLAttention):
@@ -112,7 +112,7 @@ class Qwen2_5_VLFastVAttention(Qwen2_5_VLAttention):
             if channel_method == "rotatek":
                 s_prompt, s_vision = key_prompt.shape[-2], key_pruned.shape[-2]
                 q_squeezed = query_states.squeeze(2)  # [B, H_q, D]
-                attn_output, _, _ = rotatek_decode_fused_triton(
+                attn_output, _, _ = rotatek_decode(
                     q_full=q_squeezed,
                     R_partial=past_key_value.rotatek_rotations[self.layer_idx],
                     delta_mu=past_key_value.rotatek_means[self.layer_idx],

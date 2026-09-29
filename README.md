@@ -134,9 +134,25 @@ channels — the setting used throughout the paper.
 # fused RotateK decode vs the full-channel baseline
 python scripts/paper/kernel/kernel_profile.py --kernel both --seqlen 16000 --batch_size 32
 
-# the same comparison under CUDA-graph capture, which removes launch cost
+# the same comparison under CUDA-graph capture, which removes launch cost,
+# for both kernel families (see "Decode kernels" below)
 python scripts/paper/kernel/graph_bench.py
 ```
+
+**Decode kernels.** Two kernel families are included, selected with
+`ROTATEK_KERNEL` for every script (RotateK and the full-width baselines switch
+together, so methods are always compared on the same family):
+
+| `ROTATEK_KERNEL` | | |
+| --- | --- | --- |
+| `paper` (default) | `fused_decode.py`, `full_channel_flash_decoding.py` | one program per query head; the paper's latency results (Sec. 4.3, Fig. 7) were measured with these |
+| `gqa` | `gqa_decode.py` | the query heads of a GQA group share each K/V tile; 2.9–6.3× faster kernels at 16K context, batch 32 |
+
+With `gqa` the RotateK-over-dense kernel speedup settles near the K/V byte ratio
+(about 1.5× from 16K context and batch 4 up) instead of the ~2× seen with
+`paper`, where the dense baseline re-reads K/V once per query head. At 1K
+context it is about 1.0× at batch 1 and 1.2–1.4× at batch 16–32; there the
+kernels are short enough that wave quantization makes timings shape-sensitive.
 
 **Model latency** (tier 2, LLaVA-NeXT-8B as in the paper):
 
@@ -196,6 +212,7 @@ rotatek/                   core method — no model-specific code
   rotation.py              top-k eigenbasis by Cholesky-QR subspace iteration
   kernels/fused_decode.py  decode over rotated-truncated visual Keys (2 Triton kernels)
   kernels/full_channel_flash_decoding.py   full-width decode (baselines)
+  kernels/gqa_decode.py    both of the above with K/V shared across a GQA group
   baselines/               ThinK and SparK channel selection
 integrations/lmms_eval/    installed into lmms-eval by apply_overrides.py
   models/simple/           lmms-eval wrappers (Qwen2.5-VL / LLaVA-NeXT × VisionZip / FastV)
@@ -218,6 +235,7 @@ upstream. `rotatek/` has no dependency on any model or cache class.
 | --- | --- | --- |
 | `ROTATEK_SOLVER` | `power_iter` | `power_iter` (Cholesky-QR subspace iteration) or `eigh` (exact, the solver ablation) |
 | `ROTATEK_QUERY_AWARE` | `1` | `0` ablates query-weighted PCA (K-only PCA) |
+| `ROTATEK_KERNEL` | `paper` | decode kernel family: `paper` or `gqa` (see "Decode kernels") |
 | `ROTATEK_COMPILE` | unset | `1` CUDA-graphs the subspace iteration (latency runs) |
 | `THINK_COMPILE` / `SPARK_COMPILE` | unset | `default` compiles the baselines' selection (latency runs) |
 | `OPENAI_API_KEY` | — | Only for `llava_in_the_wild` / `mmvet` (GPT-judged) |

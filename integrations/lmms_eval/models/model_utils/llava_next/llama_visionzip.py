@@ -34,8 +34,7 @@ from transformers.models.llama.modeling_llama import (
 
 from lmms_eval.models.model_utils.kv_pruning_utils import init_channel_pruner
 from lmms_eval.models.model_utils.cache_utils import Cache, DynamicCache
-from rotatek.kernels.fused_decode import rotatek_decode_fused_triton
-from rotatek.kernels.full_channel_flash_decoding import full_channel_decode_triton
+from rotatek.kernels import full_channel_decode, rotatek_decode
 
 
 DECODE_STAGES = (
@@ -182,7 +181,7 @@ class LlamaVisionZipAttention(nn.Module):
             timer.stop("cache_update")
             if use_triton_decode:
                 timer.start("custom_decode_kernel")
-                attn_output = full_channel_decode_triton(
+                attn_output = full_channel_decode(
                     q=query_states.squeeze(-2), k=key_states, v=value_states,
                     num_kv_groups=self.num_key_value_groups,
                 )
@@ -201,7 +200,7 @@ class LlamaVisionZipAttention(nn.Module):
                 timer.start("custom_decode_kernel")
                 s_prompt, s_vision = key_prompt.shape[-2], key_pruned.shape[-2]
                 q_squeezed = query_states.squeeze(2)  # [B, H_q, D]
-                attn_output, _, _ = rotatek_decode_fused_triton(
+                attn_output, _, _ = rotatek_decode(
                     q_full=q_squeezed,
                     R_partial=past_key_value.rotatek_rotations[self.layer_idx],
                     delta_mu=past_key_value.rotatek_means[self.layer_idx],
@@ -237,7 +236,7 @@ class LlamaVisionZipAttention(nn.Module):
 
                 if use_triton_decode:
                     timer.start("custom_decode_kernel")
-                    attn_output = full_channel_decode_triton(
+                    attn_output = full_channel_decode(
                         q=query_states.squeeze(-2), k=key_states, v=value_states,
                         num_kv_groups=self.num_key_value_groups,
                     )

@@ -1,4 +1,5 @@
-"""Eager-launch vs CUDA-graph-captured timing for the RotateK and dense kernels.
+"""Eager-launch vs CUDA-graph-captured timing for the RotateK and dense kernels,
+for both kernel families (`paper`, `gqa`; see rotatek/kernels/__init__.py).
 
 The repo's profiler already brackets the whole rep loop with one CUDA-event pair,
 so it is not per-call wall clock -- but it still includes per-launch CPU cost,
@@ -49,32 +50,28 @@ def main():
     ap.add_argument("--reps", type=int, default=300)
     ap.add_argument("--warmup", type=int, default=30)
     a = ap.parse_args()
-    print(f"{'S':>6} {'B':>3} | {'eager rotatek':>13} {'eager dense':>11} {'eager x':>7}"
+    print(f"{'impl':>5} {'S':>6} {'B':>3} | {'eager rotatek':>13} {'eager dense':>11} {'eager x':>7}"
           f" | {'graph rotatek':>13} {'graph dense':>11} {'graph x':>7}")
-    print("-" * 92)
-    for cfg in a.configs.split(","):
-        S, B = (int(x) for x in cfg.split("x"))
-        inp = KP._make_inputs(S, bsz=B)
-        # rebuild the closures the profiler uses
-        from rotatek.kernels.fused_decode import rotatek_decode_fused_triton
-        from rotatek.kernels.full_channel_flash_decoding import full_channel_decode_triton
-        def rot():
-            return rotatek_decode_fused_triton(
-                q_full=inp["q_full"], R_partial=inp["R_partial"], delta_mu=inp["delta_mu"],
-                k_full=inp["k_full"], v_full=inp["v_full"], mask_full=inp["mask_full"],
-                k_sparse=inp["k_sparse"], v_sparse=inp["v_sparse"],
-                num_kv_groups=KP.H_Q // KP.H_KV)
-        def den():
-            return full_channel_decode_triton(
-                inp["q_full"], inp["k_dense"], inp["v_dense"],
-                num_kv_groups=KP.H_Q // KP.H_KV)
-        er, ed = bench_eager(rot, a.reps, a.warmup), bench_eager(den, a.reps, a.warmup)
-        try:
-            gr, gd = bench_graph(rot, a.reps, a.warmup), bench_graph(den, a.reps, a.warmup)
-            gs = f"{gr:13.1f} {gd:11.1f} {gd/gr:6.2f}x"
-        except Exception as ex:
-            gs = f"  graph capture failed: {type(ex).__name__}: {str(ex)[:40]}"
-        print(f"{S:>6} {B:>3} | {er:13.1f} {ed:11.1f} {ed/er:6.2f}x | {gs}")
+    print("-" * 98)
+    for impl, (rotatek_fn, dense_fn) in KP.IMPLS.items():
+        for cfg in a.configs.split(","):
+            S, B = (int(x) for x in cfg.split("x"))
+            inp = KP._make_inputs(S, bsz=B)
 
+            def rot():
+                return rotatek_fn(
+                    q_full=inp["q_full"], R_partial=inp["R_partial"], delta_mu=inp["delta_mu"],
+                    k_full=inp["k_full"], v_full=inp["v_full"], mask_full=inp["mask_full"],
+                    k_sparse=inp["k_sparse"], v_sparse=inp["v_sparse"],
+                    num_kv_groups=KP.NUM_KV_GROUPS)
+
+            def den():
+                return dense_fn(inp["q_full"], inp["k_dense"], inp["v_dense"],
+                                num_kv_groups=KP.NUM_KV_GROUPS)
+
+            er, ed = bench_eager(rot, a.reps, a.warmup), bench_eager(den, a.reps, a.warmup)
+            gr, gd = bench_graph(rot, a.reps, a.warmup), bench_graph(den, a.reps, a.warmup)
+            print(f"{impl:>5} {S:>6} {B:>3} | {er:13.1f} {ed:11.1f} {ed/er:6.2f}x | "
+                  f"{gr:13.1f} {gd:11.1f} {gd/gr:6.2f}x")
 
 main()

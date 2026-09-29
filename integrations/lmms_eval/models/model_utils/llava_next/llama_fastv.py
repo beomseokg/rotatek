@@ -36,12 +36,12 @@ from transformers.models.llama.modeling_llama import (
 )
 
 from lmms_eval.models.model_utils.cache_utils import Cache, DynamicCache
+from rotatek.kernels import rotatek_decode
 from lmms_eval.models.model_utils.kv_pruning_utils import init_channel_pruner
 from lmms_eval.models.model_utils.llava_next.llama_visionzip import (
     LlamaVisionZipAttention,
     LlamaVisionZipDecoderLayer,
 )
-from rotatek.kernels.fused_decode import rotatek_decode_fused_triton
 
 
 # Projections come from LlamaVisionZipAttention; the forward adds an eager
@@ -106,7 +106,7 @@ class LlamaFastVAttention(LlamaVisionZipAttention):
             if channel_method == "rotatek":
                 s_prompt, s_vision = key_prompt.shape[-2], key_pruned.shape[-2]
                 q_squeezed = query_states.squeeze(2)  # [B, H_q, D]
-                attn_output, _, _ = rotatek_decode_fused_triton(
+                attn_output, _, _ = rotatek_decode(
                     q_full=q_squeezed,
                     R_partial=past_key_value.rotatek_rotations[self.layer_idx],
                     delta_mu=past_key_value.rotatek_means[self.layer_idx],

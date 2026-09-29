@@ -2,6 +2,8 @@
 
 Synthesizes one decode step at an 8B-class GQA shape (H_q=32, H_kv=8, D=128,
 D_keep=32 at channel_ratio=0.75) and times each kernel in a tight loop.
+`--impl paper` (default) is the kernel pair the paper measured; `--impl gqa`
+shares each K/V tile across the query heads of a GQA group.
 
     python scripts/paper/kernel/kernel_profile.py --kernel both --seqlen 16000 --batch_size 32
 """
@@ -24,10 +26,14 @@ os.environ.setdefault(
 
 import torch  # noqa: E402
 
-from rotatek.kernels.full_channel_flash_decoding import (  # noqa: E402
-    full_channel_decode_triton,
-)
+from rotatek.kernels.full_channel_flash_decoding import full_channel_decode_triton  # noqa: E402
 from rotatek.kernels.fused_decode import rotatek_decode_fused_triton  # noqa: E402
+from rotatek.kernels.gqa_decode import full_channel_decode_gqa, rotatek_decode_gqa  # noqa: E402
+
+IMPLS = {
+    "paper": (rotatek_decode_fused_triton, full_channel_decode_triton),
+    "gqa": (rotatek_decode_gqa, full_channel_decode_gqa),
+}
 
 
 H_Q = 32
@@ -85,6 +91,7 @@ def _bench(name: str, fn, reps: int, warmup: int) -> float:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kernel", choices=["rotatek", "dense", "both"], default="both")
+    ap.add_argument("--impl", choices=sorted(IMPLS), default="paper")
     ap.add_argument("--seqlen", type=int, default=12000,
                     help="Vision tokens (= rotatek sparse seqlen)")
     ap.add_argument("--batch_size", type=int, default=1)
@@ -92,7 +99,8 @@ def main():
     ap.add_argument("--warmup", type=int, default=20)
     args = ap.parse_args()
 
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    rotatek_fn, dense_fn = IMPLS[args.impl]
+    print(f"GPU: {torch.cuda.get_device_name(0)}   kernels: {args.impl}")
     print(f"shape: H_q={H_Q} H_kv={H_KV} D={HEAD_DIM} D_keep={HEAD_DIM_KEEP}")
     print(f"S_vision={args.seqlen} S_prompt={S_PROMPT} S_text={S_TEXT} B={args.batch_size}")
     print()
@@ -100,7 +108,7 @@ def main():
     inp = _make_inputs(args.seqlen, bsz=args.batch_size)
 
     def _rotatek_call():
-        rotatek_decode_fused_triton(
+        rotatek_fn(
             q_full=inp["q_full"],
             R_partial=inp["R_partial"],
             delta_mu=inp["delta_mu"],
@@ -113,7 +121,7 @@ def main():
         )
 
     def _dense_call():
-        full_channel_decode_triton(
+        dense_fn(
             q=inp["q_full"],
             k=inp["k_dense"],
             v=inp["v_dense"],
