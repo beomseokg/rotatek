@@ -1,6 +1,6 @@
 """Accuracy of token pruning (VisionZip / FastV) combined with Key channel pruning.
 
-    python scripts/paper/accuracy/evaluate.py --model qwen --pruner visionzip \\
+    python scripts/paper/accuracy/eval_accuracy.py --model qwen --pruner visionzip \\
         --method rotatek --token_ratio 0.40 --channel_ratio 0.75 \\
         --tasks textvqa_val,infovqa_val,chartqa,docvqa_val,vizwiz_vqa_val
 

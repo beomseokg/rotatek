@@ -1,5 +1,5 @@
 """TextVQA / InfoVQA / ChartQA (lite): token-only vs ThinK / SparK / RotateK
-at matched KV budgets, Qwen2.5-VL-7B. One `evaluate.py` process per cell,
+at matched KV budgets, Qwen2.5-VL-7B. One `eval_accuracy.py` process per cell,
 sharded over the GPUs in CUDA_VISIBLE_DEVICES (all GPUs if unset). Cells whose
 log already holds a result are skipped, so re-running only redoes the ones
 that failed."""
@@ -36,7 +36,7 @@ def main():
     for (pruner, method, ratio, chan), ds in itertools.product(ARMS, DATASETS):
         tag = f"{pruner}_{method}_t{ratio}_c{chan}_{ds}"
         if not finished(OUT / f"{tag}.log"):
-            jobs.append((tag, [sys.executable, str(REPO / "scripts/paper/accuracy/evaluate.py"),
+            jobs.append((tag, [sys.executable, str(REPO / "scripts/paper/accuracy/eval_accuracy.py"),
                                "--model", "qwen", "--pruner", pruner, "--method", method,
                                "--token_ratio", ratio, "--channel_ratio", chan,
                                "--tasks", ds, "--output_dir", str(OUT)]))

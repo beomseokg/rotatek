@@ -107,7 +107,7 @@ scored by a GPT judge (`gpt-4o-mini`), so running those requires
 Qwen2.5-VL-7B with VisionZip token pruning plus RotateK channel pruning:
 
 ```bash
-python scripts/paper/accuracy/evaluate.py --model qwen --pruner visionzip \
+python scripts/paper/accuracy/eval_accuracy.py --model qwen --pruner visionzip \
     --method rotatek --token_ratio 0.40 --channel_ratio 0.75 --tasks textvqa_val
 ```
 
@@ -158,15 +158,15 @@ decode breakdown. The sweeps set `THINK_COMPILE` / `SPARK_COMPILE` /
 TASKS=textvqa_val,infovqa_val,chartqa,docvqa_val,vizwiz_vqa_val
 
 # token pruning + Key channel pruning (method: think | spark | rotatek)
-python scripts/paper/accuracy/evaluate.py --model llava --pruner fastv \
+python scripts/paper/accuracy/eval_accuracy.py --model llava --pruner fastv \
     --method rotatek --token_ratio 0.30 --channel_ratio 0.75 --tasks $TASKS
 
 # token pruning only, at a matched KV budget
-python scripts/paper/accuracy/evaluate.py --model llava --pruner fastv \
+python scripts/paper/accuracy/eval_accuracy.py --model llava --pruner fastv \
     --token_ratio 0.19 --channel_ratio 0 --tasks $TASKS
 
 # unpruned baseline
-python scripts/paper/accuracy/evaluate.py --model llava --pruner visionzip \
+python scripts/paper/accuracy/eval_accuracy.py --model llava --pruner visionzip \
     --token_ratio 1.0 --channel_ratio 0 --tasks $TASKS
 ```
 
@@ -183,8 +183,8 @@ The appendix ablation (Cholesky vs. `eigh`, query-aware vs. query-agnostic) uses
 the same script with environment variables:
 
 ```bash
-ROTATEK_SOLVER=eigh      python scripts/paper/accuracy/evaluate.py ...   # full eigendecomposition
-ROTATEK_QUERY_AWARE=0    python scripts/paper/accuracy/evaluate.py ...   # K-only PCA
+ROTATEK_SOLVER=eigh      python scripts/paper/accuracy/eval_accuracy.py ...   # full eigendecomposition
+ROTATEK_QUERY_AWARE=0    python scripts/paper/accuracy/eval_accuracy.py ...   # K-only PCA
 ```
 
 ---
