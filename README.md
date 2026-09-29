@@ -30,66 +30,68 @@ prompt and text span in one launch, merging them with a single online softmax.
 
 ## Install
 
-Python 3.11 and a CUDA-capable GPU are required (the decode kernel is Triton).
+Three kinds of experiment live in this repo and they need different things
+installed. Do only the tier you need.
+
+| | needs | directory |
+| --- | --- | --- |
+| **1. Kernel microbenchmarks** | torch + triton | `scripts/paper/kernel/` |
+| **2. Model latency** | $+$ the backbone weights, FlashAttention, lmms-eval integration | `scripts/paper/latency/` |
+| **3. Accuracy** | $+$ benchmark datasets (and an API key for GPT-judged tasks) | `scripts/paper/accuracy/` |
+
+Python 3.11 and a CUDA-capable GPU are required throughout (the decode kernel is
+Triton).
+
+### Tier 1 — kernels
 
 ```bash
 git clone https://github.com/beomseokg/rotatek.git
 cd rotatek
-
 conda create -n rotatek python=3.11 -y && conda activate rotatek
 
-# 1. PyTorch first, so triton picks up the matching CUDA build
 pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-
-# 2. Everything else
 pip install -r requirements.txt
 ```
 
-That is enough for the `rotatek` package itself (rotation + Triton kernels).
 No `pip install` of this repo is needed — the scripts put the repo root on
-`sys.path` themselves, so they run from any working directory.
+`sys.path` themselves, so they run from any working directory. This is enough for
+everything under `scripts/paper/kernel/`, which builds its inputs synthetically
+and touches neither a checkpoint nor a dataset.
 
-### For the paper scripts
+### Tier 2 — model latency
 
-`scripts/paper/` loads the backbones with `attn_implementation=flash_attention_2`,
-which needs FlashAttention. It is installed separately because its `setup.py`
-imports `torch` at build time, which fails inside pip's isolated build
-environment:
-
-```bash
-pip install flash-attn==2.7.4.post1 --no-build-isolation
-```
-
-Building from source takes a while; if a prebuilt wheel exists for your
-torch/CUDA/Python combination, pip will use it instead.
-
-> On clusters with an NFS home directory, this can fail with
-> `Invalid cross-device link` — pip builds the wheel in a local `/tmp` and then
-> cannot move it into the cache on NFS. Point both at the same filesystem:
-> `TMPDIR=~/.cache/pip/tmp pip install flash-attn==2.7.4.post1 --no-build-isolation`
-
-### For the accuracy benchmarks only
-
-Accuracy is evaluated through [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval).
-RotateK hooks into the model definitions, so its integration has to be installed
-over an installed lmms-eval:
+The latency drivers load a real backbone (still on synthetic token spans, with
+the vision tower bypassed), so they additionally need FlashAttention and the
+lmms-eval integration:
 
 ```bash
 # lmms-eval pulls its own torch; install it BEFORE pinning torch, or re-pin after
 pip install lmms-eval==0.5.0
 pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
+pip install flash-attn==2.7.4.post1 --no-build-isolation
+
 python integrations/apply_overrides.py          # copy files + register models
 python integrations/apply_overrides.py --check  # verify
 ```
 
-`apply_overrides.py` does three things that a plain file copy does not: it copies
-the integration files, registers the wrappers in lmms-eval's model registry
-(otherwise `--model qwen2_5_vl_visionzip` reports "not found"), and drops a
-`.pth` so the copied wrappers can `import rotatek` from site-packages. It is
-idempotent and backs up the file it edits.
+> FlashAttention is installed separately because its `setup.py` imports `torch` at
+> build time, which fails inside pip's isolated build environment. On clusters with
+> an NFS home this can also fail with `Invalid cross-device link` — pip builds in a
+> local `/tmp` and cannot move the wheel onto NFS. Point both at one filesystem:
+> `TMPDIR=~/.cache/pip/tmp pip install flash-attn==2.7.4.post1 --no-build-isolation`
 
-Latency benchmarks do **not** need any of this.
+`apply_overrides.py` does three things a plain file copy does not: it copies the
+integration files, registers the wrappers in lmms-eval's model registry (otherwise
+`--model qwen2_5_vl_visionzip` reports "not found"), and drops a `.pth` so the
+copied wrappers can `import rotatek` from site-packages. It is idempotent and
+backs up the file it edits.
+
+### Tier 3 — accuracy
+
+Nothing further to install; the benchmarks download on first use through
+lmms-eval. GPT-judged tasks (`mmvet`, `llava_in_the_wild`, `dc100_en`) need
+`OPENAI_API_KEY`.
 
 ---
 
@@ -99,7 +101,7 @@ Reproduce one accuracy row — Qwen2.5-VL-7B with VisionZip token pruning plus
 RotateK channel pruning:
 
 ```bash
-python scripts/paper/eval/visionzip_qwen.py
+python scripts/paper/accuracy/visionzip_qwen.py
 ```
 
 Or measure decode latency without touching lmms-eval or any dataset (synthetic
@@ -119,28 +121,51 @@ channels — the setting used throughout the paper.
 
 ## Reproducing the paper
 
-| What | Command |
-| --- | --- |
-| Accuracy, Qwen2.5-VL + VisionZip | `python scripts/paper/eval/visionzip_qwen.py` |
-| Accuracy, Qwen2.5-VL + FastV | `python scripts/paper/eval/fastv_qwen.py` |
-| Accuracy, LLaVA-NeXT + VisionZip | `python scripts/paper/eval/visionzip_llava_next.py` |
-| Accuracy, LLaVA-NeXT + FastV | `python scripts/paper/eval/fastv_llava_next.py` |
-| Prefill / decode vs. sequence length | `./scripts/paper/latency/run_llava_next_seqlen_sweep.sh` |
-| Prefill / decode vs. batch size | `./scripts/paper/latency/run_llava_next_batch_sweep.sh` |
-| Max batch + throughput | `python scripts/paper/latency/max_batch_sweep_llava_next.py sweep --prefill_length 64k --methods full,think,spark,rotatek --decode_tokens 64` |
-| Solver comparison (CholQR / eigh / randomized) | `python scripts/paper/latency/kernel_breakdown.py` |
+**Kernels** (tier 1 — no checkpoint, no dataset):
 
-Each eval wrapper has a `__main__` block listing the datasets and the channel
-method (`think` / `spark` / `rotatek`) to sweep; edit those lists to change the
-grid. Latency runs write a JSON plus a text log under `results/`.
+```bash
+# fused sparse-channel decode vs the full-channel baseline
+python scripts/paper/kernel/kernel_profile.py --kernel both --seqlen 16000 --batch_size 32
+
+# the same comparison under CUDA-graph capture, which removes launch cost
+python scripts/paper/kernel/graph_bench.py
+
+# basis-construction solvers (Cholesky-QR / eigh / randomized)
+python scripts/paper/kernel/kernel_breakdown.py
+```
+
+**Model latency** (tier 2):
+
+```bash
+./scripts/paper/latency/run_llava_next_seqlen_sweep.sh   # prefill 16k-128k, batch 1
+./scripts/paper/latency/run_llava_next_batch_sweep.sh    # prefill 16k, batch sweep
+python scripts/paper/latency/max_batch_sweep_llava_next.py sweep \
+    --prefill_length 64k --methods full,think,spark,rotatek --decode_tokens 64
+```
+
+**Accuracy** (tier 3):
+
+| | |
+| --- | --- |
+| Qwen2.5-VL $+$ VisionZip | `python scripts/paper/accuracy/visionzip_qwen.py` |
+| Qwen2.5-VL $+$ FastV | `python scripts/paper/accuracy/fastv_qwen.py` |
+| LLaVA-NeXT $+$ VisionZip | `python scripts/paper/accuracy/visionzip_llava_next.py` |
+| LLaVA-NeXT $+$ FastV | `python scripts/paper/accuracy/fastv_llava_next.py` |
+| Lite ablation, all arms | `python scripts/paper/accuracy/lite_sweep.py` |
+
+`lite_sweep.py` runs TextVQA / InfoVQA / ChartQA (lmms-eval lite) across
+token-only, ThinK, SparK and RotateK at matched KV budgets and shards the 24
+cells over the visible GPUs; the write-up is in
+[`docs/lite_ablation.pdf`](docs/lite_ablation.pdf). The other wrappers take their
+dataset list and channel method from the `__main__` block at the bottom.
 
 The appendix ablation (Cholesky vs. `eigh`, query-aware vs. query-agnostic) comes
 from the same wrappers with different environment variables:
 
 ```bash
-python scripts/paper/eval/fastv_qwen.py                          # Cholesky + Q-aware (default)
-ROTATEK_SOLVER=eigh python scripts/paper/eval/fastv_qwen.py      # full eigendecomposition
-ROTATEK_QUERY_AWARE=0 python scripts/paper/eval/fastv_qwen.py    # K-only PCA
+python scripts/paper/accuracy/fastv_qwen.py                          # Cholesky + Q-aware (default)
+ROTATEK_SOLVER=eigh python scripts/paper/accuracy/fastv_qwen.py      # full eigendecomposition
+ROTATEK_QUERY_AWARE=0 python scripts/paper/accuracy/fastv_qwen.py    # K-only PCA
 ```
 
 ---
@@ -154,8 +179,9 @@ rotatek/                 core method — no model-specific code
   kernels/               Triton kernels (fused sparse-channel + full-channel decode)
   baselines/             ThinK and SparK, for comparison
 integrations/lmms_eval/  drop-in overrides for an installed lmms-eval
-scripts/paper/eval/      accuracy drivers used for the paper
-scripts/paper/latency/   latency and throughput drivers used for the paper
+scripts/paper/kernel/    kernel microbenchmarks   (torch + triton only)
+scripts/paper/latency/   model latency drivers    (+ backbone, lmms-eval)
+scripts/paper/accuracy/  accuracy drivers         (+ datasets)
 assets/                  figures
 ```
 

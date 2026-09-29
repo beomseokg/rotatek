@@ -18,7 +18,7 @@ GPUS = [0, 1, 2, 3, 4, 5, 6]
 CODE = '''
 import os, sys
 sys.path.insert(0, "{repo}")
-sys.path.insert(0, "{repo}/scripts/paper/eval")
+sys.path.insert(0, "{repo}/scripts/paper/accuracy")
 os.chdir("{repo}")
 import {mod} as M
 M.run_evaluate("{out}", dataset="{ds}", method="{method}", log=False,
