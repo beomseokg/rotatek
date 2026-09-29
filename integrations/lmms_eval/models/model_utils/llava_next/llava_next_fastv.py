@@ -101,7 +101,7 @@ class LlavaNextFastVForConditionalGeneration(LlavaNextForConditionalGeneration):
                 lm_model.fast_v_num_placeholders = int(mask[0].sum().item())  # per-sample (matches nz=mask[0]); was mask.sum()=batch-total -> broke batch>1
                 # ThinK / channel pruning needs prompt_seqlen (text BEFORE the
                 # vision span in the merged sequence) and query_seqlen (text
-                # AFTER vision). Stamp on text_config so init_visionzip picks
+                # AFTER vision). Stamp on text_config so init_channel_pruner picks
                 # them up at prefill. Mirrors visionzip wrapper.
                 self.config.text_config.prompt_seqlen = int(nz[0].item())
                 self.config.text_config.query_seqlen = int(input_ids.shape[1] - nz[-1].item() - 1)

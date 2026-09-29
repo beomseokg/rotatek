@@ -36,7 +36,7 @@ from transformers.models.llama.modeling_llama import (
 )
 
 from lmms_eval.models.model_utils.cache_utils import Cache, DynamicCache
-from lmms_eval.models.model_utils.kv_pruning_utils import init_visionzip
+from lmms_eval.models.model_utils.kv_pruning_utils import init_channel_pruner
 from lmms_eval.models.model_utils.llava_next.llama_visionzip import (
     LlamaVisionZipAttention,
     LlamaVisionZipDecoderLayer,
@@ -64,7 +64,7 @@ class LlamaFastVAttention(LlamaVisionZipAttention):
         channel_ratio = self.config.channel_ratio
 
         if q_len > 1:
-            init_visionzip(self)
+            init_channel_pruner(self)
 
         query_states = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
@@ -78,22 +78,22 @@ class LlamaFastVAttention(LlamaVisionZipAttention):
             if channel_ratio == 0.0:
                 past_key_value.store_unified(key_states, value_states, self.layer_idx)
             else:
-                update = {"think": self.kv_cluster.update_think,
-                          "spark": self.kv_cluster.update_spark,
-                          "rotatek": self.kv_cluster.update_rotatek}[channel_method]
+                update = {"think": self.channel_pruner.update_think,
+                          "spark": self.channel_pruner.update_spark,
+                          "rotatek": self.channel_pruner.update_rotatek}[channel_method]
                 kv_pruned, kv_prompt, kv_text, mask, value_states_compress = update(
                     key_states, query_states, value_states, attention_mask,
                     num_key_value_groups=self.num_key_value_groups,
                 )
                 past_key_value.store_pruned(kv_pruned, kv_prompt, kv_text, mask, value_states_compress, self.layer_idx)
                 if channel_method == "think":
-                    past_key_value.think_mask.append(self.kv_cluster.current_think_mask)
+                    past_key_value.think_mask.append(self.channel_pruner.current_think_mask)
                 elif channel_method == "spark":
-                    past_key_value.spark_mask.append(self.kv_cluster.current_spark_mask)
-                    past_key_value.spark_pruned_mean.append(self.kv_cluster.current_spark_pruned_mean)
+                    past_key_value.spark_mask.append(self.channel_pruner.current_spark_mask)
+                    past_key_value.spark_pruned_mean.append(self.channel_pruner.current_spark_pruned_mean)
                 else:
-                    past_key_value.rotatek_rotations.append(self.kv_cluster.current_rotatek_R_partial)
-                    past_key_value.rotatek_means.append(self.kv_cluster.current_rotatek_delta_mu)
+                    past_key_value.rotatek_rotations.append(self.channel_pruner.current_rotatek_R_partial)
+                    past_key_value.rotatek_means.append(self.channel_pruner.current_rotatek_delta_mu)
             k_for_compute, v_for_compute = key_states, value_states
 
         elif channel_ratio == 0.0:  # decode, uncompressed

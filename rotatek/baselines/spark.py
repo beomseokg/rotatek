@@ -4,7 +4,7 @@
 
 Scores each visual token's channels by ||Q||_2 · K² and keeps the top
 D_keep per token; the pruned channels are filled with their per-token
-mean at decode (see ``kv_pruning_utils.VisionZipCluster.update_spark``).
+mean at decode (see ``kv_pruning_utils.ChannelPruner.update_spark``).
 """
 import os
 
@@ -66,5 +66,5 @@ if _SPARK_COMPILE_MODE in ("1", "default", "true", "reduce", "reduce-overhead"):
     # Use default inductor mode only — `reduce-overhead` aliases the
     # function's outputs with CUDA-graph buffers that get overwritten
     # on the next call, silently corrupting `keep_mask` / `pruned_mean`
-    # appended to the cluster cache.
+    # appended to the KV cache.
     per_token_channel_prune = torch.compile(per_token_channel_prune, dynamic=True)

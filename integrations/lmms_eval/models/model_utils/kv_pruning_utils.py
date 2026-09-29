@@ -1,7 +1,7 @@
 """Prefill-time Key channel pruning for the visual span: ThinK, SparK, RotateK.
 
-Each attention layer owns a ``VisionZipCluster`` (created by ``init_visionzip``
-at every prefill). The adapter hands it the layer's full Keys; the cluster
+Each attention layer owns a ``ChannelPruner`` (created by ``init_channel_pruner``
+at every prefill). The adapter hands it the layer's full Keys; the pruner
 slices out the visual span ``[prompt_seqlen : total - query_seqlen]``, prunes
 its channels, and returns
 
@@ -23,11 +23,11 @@ _ROTATEK_QUERY_AWARE = bool(int(os.environ.get("ROTATEK_QUERY_AWARE", "1")))
 QUERY_WINDOW = 32  # recent text queries used to score channels (all methods)
 
 
-def _split_spans(cluster, key_states):
+def _split_spans(pruner, key_states):
     """(prompt Keys, visual Keys, text Keys) of a [B, H_kv, S, D] tensor."""
     total_seq_len = key_states.shape[-2]
-    prompt_seqlen = max(0, min(cluster.prompt_seqlen, total_seq_len))
-    query_seqlen = max(0, min(cluster.query_seqlen, max(total_seq_len - prompt_seqlen, 0)))
+    prompt_seqlen = max(0, min(pruner.prompt_seqlen, total_seq_len))
+    query_seqlen = max(0, min(pruner.query_seqlen, max(total_seq_len - prompt_seqlen, 0)))
     vision_end = total_seq_len - query_seqlen if query_seqlen > 0 else total_seq_len
     kv_prompt = key_states[:, :, :prompt_seqlen, :]
     keys_vision = key_states[:, :, prompt_seqlen:vision_end, :]
@@ -35,7 +35,7 @@ def _split_spans(cluster, key_states):
     return kv_prompt, keys_vision, kv_text
 
 
-class VisionZipCluster:
+class ChannelPruner:
     def __init__(self, ratio, prompt_seqlen, query_seqlen):
         self.ratio = ratio                  # fraction of channels to prune
         self.prompt_seqlen = prompt_seqlen  # tokens before the visual span
@@ -51,11 +51,11 @@ class VisionZipCluster:
 
         assert key_states.shape[-2] == query_states.shape[-2]
         kv_prompt, keys_vision, kv_text = _split_spans(self, key_states)
-        num_heads, head_dim = key_states.shape[1], key_states.shape[-1]
+        num_kv_heads, head_dim = key_states.shape[1], key_states.shape[-1]
         prune_count = min(head_dim, max(0, int(head_dim * self.ratio)))
         query_window = min(QUERY_WINDOW, query_states.shape[2])
         K_compact, keep_mask = think_score_and_compact(
-            keys_vision, query_states[..., -query_window:, :], num_heads, prune_count,
+            keys_vision, query_states[..., -query_window:, :], num_kv_heads, prune_count,
         )
         self.current_think_mask = keep_mask
         return K_compact, kv_prompt, kv_text, keep_mask, value_states
@@ -118,14 +118,14 @@ class VisionZipCluster:
             # Weighting K's channels by ||q|| commutes through the covariance:
             #   sum_s (K[s,d] q[d]) (K[s,e] q[e]) = q[d] q[e] · cov[d,e]
             # so it costs O(D²) on the [D, D] matrix instead of a pass over K.
-            q_window = min(QUERY_WINDOW, query_states.shape[2])
-            q_recent = query_states[..., -q_window:, :]                     # [B, H_q, W, D]
-            h_q = q_recent.shape[1]
-            if h_q != num_kv_heads:  # GQA: group-mean H_q -> H_kv
-                q_recent = q_recent.view(
-                    bsz, num_kv_heads, h_q // num_kv_heads, q_window, head_dim,
+            query_window = min(QUERY_WINDOW, query_states.shape[2])
+            queries_recent = query_states[..., -query_window:, :]           # [B, H_q, W, D]
+            num_q_heads = queries_recent.shape[1]
+            if num_q_heads != num_kv_heads:  # GQA: group-mean H_q -> H_kv
+                queries_recent = queries_recent.view(
+                    bsz, num_kv_heads, num_key_value_groups, query_window, head_dim,
                 ).mean(dim=2)
-            q_norm = q_recent.float().norm(dim=-2, p=2)                     # [B, H_kv, D]
+            q_norm = queries_recent.float().norm(dim=-2, p=2)               # [B, H_kv, D]
             # Floor near-zero channels at a fraction of the median so the
             # weighted covariance keeps full rank (else Cholesky can fail).
             q_floor = 1e-3 * q_norm.median(dim=-1, keepdim=True).values
@@ -160,11 +160,10 @@ class VisionZipCluster:
         return kept_kv_states, kv_prompt, kv_text, keep_mask, value_states
 
 
-def init_visionzip(self):
-    """Attach a fresh cluster to attention module `self` for this prefill."""
-    self.kv_cluster = VisionZipCluster(
+def init_channel_pruner(self):
+    """Attach a fresh pruner to attention module `self` for this prefill."""
+    self.channel_pruner = ChannelPruner(
         ratio=self.config.channel_ratio,
         prompt_seqlen=self.config.prompt_seqlen,
         query_seqlen=self.config.query_seqlen,
     )
-    self.kv_cluster.num_layers = self.config.num_hidden_layers

@@ -8,7 +8,7 @@
 #   * Slice `hidden_states` / `position_ids` at layer K, so layers >= K
 #     cache a shorter KV.
 #
-# Channel pruning (ThinK / SparK / RotateK) uses the same kv_cluster and
+# Channel pruning (ThinK / SparK / RotateK) uses the same channel_pruner and
 # DynamicCache as `Qwen2_5_VLFlashAttention2` in `qwen2_5vl_visionzip.py`.
 # Only prefill layer K-1 runs eager attention (FastV reads its weights);
 # every other layer and all decode steps use FlashAttention-2.
@@ -32,7 +32,7 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_m
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 
 from lmms_eval.models.model_utils.cache_utils import Cache
-from lmms_eval.models.model_utils.kv_pruning_utils import init_visionzip
+from lmms_eval.models.model_utils.kv_pruning_utils import init_channel_pruner
 from lmms_eval.models.model_utils.qwen import qwen2_5vl_visionzip as _vz_mod
 from lmms_eval.models.model_utils.qwen.qwen2_5vl_visionzip import (
     Qwen2_5_VLAttention,
@@ -68,7 +68,7 @@ class Qwen2_5_VLFastVAttention(Qwen2_5_VLAttention):
         channel_ratio = self.config.channel_ratio
 
         if q_len > 1:
-            init_visionzip(self)
+            init_channel_pruner(self)
 
         query_states = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
@@ -84,22 +84,22 @@ class Qwen2_5_VLFastVAttention(Qwen2_5_VLAttention):
             if channel_ratio == 0.0:
                 past_key_value.store_unified(key_states, value_states, self.layer_idx)
             else:
-                update = {"think": self.kv_cluster.update_think,
-                          "spark": self.kv_cluster.update_spark,
-                          "rotatek": self.kv_cluster.update_rotatek}[channel_method]
+                update = {"think": self.channel_pruner.update_think,
+                          "spark": self.channel_pruner.update_spark,
+                          "rotatek": self.channel_pruner.update_rotatek}[channel_method]
                 kv_pruned, kv_prompt, kv_text, mask, value_states_compress = update(
                     key_states, query_states, value_states, attention_mask,
                     num_key_value_groups=self.num_key_value_groups,
                 )
                 past_key_value.store_pruned(kv_pruned, kv_prompt, kv_text, mask, value_states_compress, self.layer_idx)
                 if channel_method == "think":
-                    past_key_value.think_mask.append(self.kv_cluster.current_think_mask)
+                    past_key_value.think_mask.append(self.channel_pruner.current_think_mask)
                 elif channel_method == "spark":
-                    past_key_value.spark_mask.append(self.kv_cluster.current_spark_mask)
-                    past_key_value.spark_pruned_mean.append(self.kv_cluster.current_spark_pruned_mean)
+                    past_key_value.spark_mask.append(self.channel_pruner.current_spark_mask)
+                    past_key_value.spark_pruned_mean.append(self.channel_pruner.current_spark_pruned_mean)
                 else:
-                    past_key_value.rotatek_rotations.append(self.kv_cluster.current_rotatek_R_partial)
-                    past_key_value.rotatek_means.append(self.kv_cluster.current_rotatek_delta_mu)
+                    past_key_value.rotatek_rotations.append(self.channel_pruner.current_rotatek_R_partial)
+                    past_key_value.rotatek_means.append(self.channel_pruner.current_rotatek_delta_mu)
             k_for_compute, v_for_compute = key_states, value_states
 
         elif channel_ratio == 0.0:  # decode, uncompressed
