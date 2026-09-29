@@ -42,6 +42,9 @@ PCA via cov + power iteration + projection (RotateK).
 Run:
   python -m latency.kernel_breakdown
 """
+
+from __future__ import annotations
+
 import os
 import sys
 
@@ -50,8 +53,6 @@ import sys
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
-
-from __future__ import annotations
 
 import sys
 import time
