@@ -61,12 +61,12 @@ class ChannelPruner:
         return K_compact, kv_prompt, kv_text, keep_mask, value_states
 
     def update_spark(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        """SparK: per-token channel pruning, pruned channels mean-filled at decode.
+        """Per-token channel pruning ("spark").
 
         Stores compact K [B, H, S, D_keep] + per-token keep mask
-        [B, H, S, D] + per-token pruned_mean [B, H, S, 1]. Decode pre-fills a
-        [B, H, S, D] buffer with `pruned_mean` and scatters compact K into the
-        kept slots — SparK's mean-fill recovery.
+        [B, H, S, D] + per-token pruned_mean [B, H, S, 1], the mean of the
+        token's pruned Key values. Decode pre-fills a [B, H, S, D] buffer with
+        `pruned_mean` and scatters compact K into the kept slots.
         """
         from rotatek.baselines.spark import per_token_channel_prune
 

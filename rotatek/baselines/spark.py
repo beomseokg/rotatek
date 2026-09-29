@@ -1,10 +1,11 @@
 # Copyright © 2025 Advanced Micro Devices, Inc. All rights reserved.
 #
-"""SparK channel-pruning math (per-token channel selection).
+"""Per-token Key channel pruning (the "spark" baseline).
 
 Scores each visual token's channels by ||Q||_2 · K² and keeps the top
-D_keep per token; the pruned channels are filled with their per-token
-mean at decode (see ``kv_pruning_utils.ChannelPruner.update_spark``).
+D_keep per token; at decode the pruned channels are filled with the mean
+of that token's pruned Key values (see
+``kv_pruning_utils.ChannelPruner.update_spark``).
 """
 import os
 
@@ -12,7 +13,7 @@ import torch
 
 
 def per_token_channel_prune(queries, keys, ratio):
-    """Per-token channel pruning with SparK scoring (compact-storage variant).
+    """Per-token channel pruning, compact storage.
 
     ThinK-parity storage shape: keeps a per-token *bool* keep mask alongside
     the compact-D kept channels and a per-token pruned-channel mean. Decode
@@ -34,7 +35,7 @@ def per_token_channel_prune(queries, keys, ratio):
     prune_count = int(head_dim * ratio)
     keep_count = head_dim - prune_count
 
-    # Per-token scoring: ||Q||_2 * K^2  (SparK reference).
+    # Per-token scoring: ||Q||_2 * K^2
     q_norm = torch.norm(queries, dim=-2, p=2).unsqueeze(-2)             # [B, H, 1, D]
     scores = torch.pow(keys, 2) * q_norm                                 # [B, H, S, D]
 
